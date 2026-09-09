@@ -1,0 +1,82 @@
+# nastemp-2 configuration - all tunable, no code edits needed
+# PWM 0-255. 102 = 40%. Default floor 40%, normal ceiling 70-75% (never 100% in normal ops).
+
+truenas:
+  # Source of HDD temps: "api" (TrueNAS HTTP API, HDD-only), "ssh" (smartctl),
+  # or "auto" (try API first, fall back to SSH). Recommended: "auto".
+  method: "auto"
+  host: "192.168.1.10"      # <-- CHANGE: TrueNAS IP
+  # --- API mode (HDD-only, no SSD) ---
+  # Create key in TrueNAS UI: Credentials -> API Keys -> Add (needs REPORTING_READ).
+  # Use https://HOST (HTTP will get the key REVOKED by TrueNAS - use https + verify_ssl:false for self-signed).
+  api_url: "https://192.168.1.10"  # <-- CHANGE: TrueNAS API base URL
+  api_key: ""               # <-- CHANGE: paste TrueNAS API key, or set env TRUENAS_API_KEY
+  verify_ssl: false         # true if you have a valid cert, false for self-signed
+  hdd_only: true            # true = ignore SSD/NVMe, control fans from spinning HDDs only
+  # --- SSH fallback mode ---
+  user: "admin"              # <-- CHANGE: TrueNAS SSH user (use key auth)
+  key_path: "/root/.ssh/id_ed25519"  # null = default ssh agent/keys
+  timeout_sec: 8
+  # drives auto-discovered. Override only if autodetect fails:
+  drives: []  # e.g. ["/dev/sda","/dev/sdb","/dev/sdc","/dev/sdd"]
+  fail_threshold: 3  # consecutive API/SSH failures before failsafe step-down + ntfy
+
+fan:
+  pwm_channel: "pwm2"       # matches your: sed 's/name/pwm2/'
+  driver_match: "it87"
+  floor_pct: 40             # default / idle speed
+  floor_pwm: 102            # 255*0.40 = 102
+  ceiling_pct: 72           # normal max - never 100% in normal regulation
+  ceiling_pwm: 184          # 255*0.72 ~= 184
+  emergency_pwm: 255        # ONLY if temp >= temp_critical
+  safe_pwm: 102             # watchdog + failsafe target (40%)
+  pwm_enable_mode: 1        # 1 = manual mode for it87
+
+temps_c:
+  cool: 36.0        # below this -> target = floor
+  warm: 40.0        # start ramping
+  hot: 45.0         # at/above this -> target = ceiling
+  critical: 52.0    # at/above this -> emergency 255 + ntfy critical
+  hysteresis: 1.5   # must drop this much below trigger before stepping down
+
+timing:
+  interval_sec: 30
+  step_up_pwm: 12         # how fast we step UP per cycle
+  step_down_pwm: 6        # slower step DOWN (noise-friendly)
+  cooldown_down_sec: 300  # must stay cool 5 min before each step-down
+  max_boost_sec: 1200     # 20 min: NEVER stay elevated longer without re-justification -> force step-down
+  heartbeat_file: "/run/nastemp/heartbeat"
+  override_file: "/run/nastemp/override.json"  # manual control from admin UI
+  log_file: "/var/log/nastemp.log"
+  jsonl_file: "/var/log/nastemp.jsonl"
+  db_file: "/var/log/nastemp.db"  # SQLite history DB (temps + fan + events), queryable + HA-friendly
+
+manual:
+  enabled: true
+  max_sec: 1800          # manual override auto-expires after 30 min (never stuck)
+  min_pwm: 102           # never below floor — fan stall protection (P12 Pro stalls <25-30%)
+
+mqtt:
+  enabled: true
+  broker: "192.168.1.5"   # <-- CHANGE: HA / Mosquitto IP
+  port: 1883
+  username: ""            # <-- CHANGE if needed, else empty
+  password: ""
+  base: "nastemp"         # topics: nastemp/fan/pwm, nastemp/hdd/max_temp, nastemp/event, ...
+  retain: true
+
+ntfy:
+  enabled: true
+  url: "http://192.168.1.5:8080/nastemp"  # <-- CHANGE: your ntfy server + topic
+  # e.g. "https://ntfy.sh/my-secret-topic-xyz"
+  on_step_up: true
+  on_step_down: false     # set true if you want down-notify (noisy)
+  on_failsafe: true
+  on_critical: true
+  on_api_fail: true       # send ntfy when TrueNAS API connection fails (1st fail + failsafe)
+  on_recovery: true       # send ntfy when a failed link (TrueNAS/MQTT/fan) recovers
+
+weather:
+  enabled: true
+  postcode: "33333"       # <-- CHANGE: your ZIP for outside temp (Open-Meteo, free, no key)
+  country: "United States"

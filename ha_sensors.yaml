@@ -1,0 +1,69 @@
+# nastemp-2 / Home Assistant MQTT sensors
+# Paste into configuration.yaml (or include). Requires Mosquitto broker + MQTT integration.
+# Topics come from fan_controller.py with base "nastemp".
+# History DB = HA recorder (default). For long history add: recorder: purge_keep_days: 30
+mqtt:
+  sensor:
+    - name: "NAS HDD Max Temp"
+      unique_id: nastemp_hdd_max
+      state_topic: "nastemp/hdd/max_temp"
+      unit_of_measurement: "°C"
+      device_class: temperature
+      state_class: measurement
+    - name: "NAS HDD Avg Temp"
+      unique_id: nastemp_hdd_avg
+      state_topic: "nastemp/hdd/avg_temp"
+      unit_of_measurement: "°C"
+      device_class: temperature
+      state_class: measurement
+    - name: "NAS Fan PWM"
+      unique_id: nastemp_fan_pwm
+      state_topic: "nastemp/fan/pwm"
+      state_class: measurement
+    - name: "NAS Fan Speed"
+      unique_id: nastemp_fan_pct
+      state_topic: "nastemp/fan/pct"
+      unit_of_measurement: "%"
+      state_class: measurement
+      icon: mdi:fan
+    - name: "NAS Fan RPM"
+      unique_id: nastemp_fan_rpm
+      state_topic: "nastemp/fan/rpm"
+      unit_of_measurement: "RPM"
+      state_class: measurement
+      icon: mdi:fan
+    - name: "NAS Fan Target"
+      unique_id: nastemp_fan_target
+      state_topic: "nastemp/fan/target"
+      state_class: measurement
+    - name: "NAS Fan Mode"
+      unique_id: nastemp_fan_mode
+      state_topic: "nastemp/fan/mode"
+      icon: mdi:account-cog
+    - name: "NAS Fan Status"
+      unique_id: nastemp_status
+      state_topic: "nastemp/status"
+    - name: "NAS Fan Event"
+      unique_id: nastemp_event
+      state_topic: "nastemp/event"
+    - name: "NAS Controller Online"
+      unique_id: nastemp_online
+      state_topic: "nastemp/online"
+    - name: "NAS Temp Source"
+      unique_id: nastemp_source
+      state_topic: "nastemp/hdd/source"
+      icon: mdi:server-network
+    - name: "NAS HDD Count"
+      unique_id: nastemp_hdd_count
+      state_topic: "nastemp/hdd/count"
+      state_class: measurement
+
+  # Per-drive temps: add one block per drive after first run
+  # (topic nastemp/hdd/sda/temp etc. - check MQTT explorer)
+  # Example:
+  #   - name: "NAS HDD sda Temp"
+  #     unique_id: nastemp_hdd_sda
+  #     state_topic: "nastemp/hdd/sda/temp"
+  #     unit_of_measurement: "°C"
+  #     device_class: temperature
+  #     state_class: measurement

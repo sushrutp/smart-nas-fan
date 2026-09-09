@@ -1,0 +1,9 @@
+# runtime / local-only (never commit)
+logs/
+*.log
+*.jsonl
+*.db
+*.bak
+__pycache__/
+*.pyc
+.env

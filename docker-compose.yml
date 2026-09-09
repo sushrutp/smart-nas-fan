@@ -1,0 +1,85 @@
+# nastemp-2 / docker-compose.yml
+# Three services: controller + watchdog (fan control, privileged, /sys rw)
+# + admin (neon control center on 0.0.0.0:6767, no privileged needed).
+# Fan control must run on the Proxmox host (or host with hwmon passthrough).
+#
+# Layout on Docker host:
+#   ./config.yaml          -> your edited config (controller:ro, admin:rw for editor)
+#   ~/.ssh/                -> SSH keys for TrueNAS fallback (mounted read-only)
+#   ./logs/                -> nastemp.log + nastemp.jsonl + nastemp.db (persisted)
+#   heartbeat volume       -> shared /run/nastemp between all containers
+#
+# Start:  docker compose up -d --build
+# Logs:   docker compose logs -f controller
+#         docker compose logs -f watchdog
+# UI:     http://<host>:6767  (ADMIN_USER / ADMIN_PASS, defaults admin/nastemp)
+#
+# Change admin password without editing compose:
+#   ADMIN_USER=me ADMIN_PASS='s3cret!' docker compose up -d admin
+
+services:
+  controller:
+    build: .
+    image: nastemp-2:latest
+    container_name: nastemp-controller
+    command: ["python", "fan_controller.py"]
+    privileged: true
+    restart: unless-stopped
+    environment:
+      NASTEMP_CONFIG: /config/config.yaml
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - ~/.ssh:/root/.ssh:ro
+      - ./logs:/var/log
+      - heartbeat:/run/nastemp
+      - /sys/class/hwmon:/sys/class/hwmon:rw
+
+  watchdog:
+    image: nastemp-2:latest
+    container_name: nastemp-watchdog
+    command: ["python", "watchdog.py"]
+    privileged: true
+    restart: unless-stopped
+    environment:
+      NASTEMP_HEARTBEAT: /run/nastemp/heartbeat
+      NASTEMP_SAFE_PWM: ${SAFE_PWM:-102}
+      NASTEMP_STALE_SEC: ${STALE_SEC:-300}
+      NASTEMP_PWM: ${PWM_CHANNEL:-pwm2}
+      # Optional: set NASTEMP_NTFY to your ntfy URL for watchdog alerts
+      # NASTEMP_NTFY: http://192.168.1.5:8080/nastemp
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./logs:/var/log
+      - heartbeat:/run/nastemp
+      # watchdog finds pwm via /sys, so it needs the same sysfs bind:
+      - /sys/class/hwmon:/sys/class/hwmon:rw
+
+    # NOTE: /sys is mounted automatically read-only in most Docker setups.
+    # privileged:true + this explicit rw bind is what allows `echo 102 > pwm2`.
+    # If your platform blocks /sys writes, use the native systemd install instead.
+
+  admin:
+    build: ./admin
+    image: nastemp-admin:latest
+    container_name: nastemp-admin
+    restart: unless-stopped
+    ports:
+      - "6767:6767"
+    environment:
+      NASTEMP_CONFIG: /config/config.yaml
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASS: ${ADMIN_PASS:-nastemp}
+      TRUENAS_API_KEY: ${TRUENAS_API_KEY:-}
+      TZ: ${TZ:-UTC}
+    volumes:
+      # rw so the UI config editor can save (controller mounts the same file ro):
+      - ./config.yaml:/config/config.yaml:rw
+      - ./logs:/var/log:ro
+      # rw: UI writes manual fan override (/run/nastemp/override.json), reads heartbeat:
+      - heartbeat:/run/nastemp:rw
+      # ro: live fan read for the animated 🌀 (no privileged needed):
+      - /sys/class/hwmon:/sys/class/hwmon:ro
+
+volumes:
+  heartbeat:

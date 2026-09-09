@@ -1,0 +1,62 @@
+# nastemp-2 / Lovelace dashboard (Settings -> Dashboards -> Edit -> Raw -> paste views)
+# KEY IDEA for your ask: temp spike + fan rise MUST share one history-graph card
+# (same time axis) so you see cause -> effect. Two graphs with the same
+# hours_to_show/refresh also line up vertically.
+views:
+  - title: NAS Cooling
+    cards:
+      - type: entities
+        title: Now (HDD-only, SSD ignored)
+        entities:
+          - entity: sensor.nas_hdd_max_temp
+          - entity: sensor.nas_hdd_avg_temp
+          - entity: sensor.nas_fan_speed
+          - entity: sensor.nas_fan_pwm
+          - entity: sensor.nas_fan_rpm
+          - entity: sensor.nas_fan_target
+          - entity: sensor.nas_fan_status
+          - entity: sensor.nas_temp_source
+          - entity: sensor.nas_controller_online
+      - type: history-graph
+        title: "Temp spike -> Fan rise (SAME axis: cause = effect)"
+        hours_to_show: 24
+        refresh_interval: 30
+        entities:
+          - entity: sensor.nas_hdd_max_temp
+            name: HDD max °C
+          - entity: sensor.nas_hdd_avg_temp
+            name: HDD avg °C
+          - entity: sensor.nas_fan_speed
+            name: Fan %
+          - entity: sensor.nas_fan_target
+            name: Target PWM
+      - type: history-graph
+        title: Fan speed detail (PWM + RPM)
+        hours_to_show: 24
+        refresh_interval: 30
+        entities:
+          - entity: sensor.nas_fan_speed
+          - entity: sensor.nas_fan_pwm
+          - entity: sensor.nas_fan_rpm
+      - type: logbook
+        title: Why did it change? (match timestamps to graph spikes)
+        hours_to_show: 24
+        entities:
+          - sensor.nas_fan_event
+          - sensor.nas_fan_status
+      - type: markdown
+        title: How to read this
+        content: >
+          Temps are HDD-ONLY (SSD/NVMe excluded via TrueNAS API type filter).
+          Step-UP happens immediately when max HDD temp rises (zone ramp/hot)
+          - you will see the temp spike and fan % rise on the SAME graph.
+          Step-DOWN waits for cooldown (default 5 min) + hysteresis 1.5C, then
+          steps down slowly. Max-boost guard forces step-down after 20 min.
+          Watchdog forces 40% if controller dies. API failure -> ntfy alert.
+          Full history: Proxmox /var/log/nastemp.db (SQLite) + .jsonl + HA recorder.
+      - type: history-graph
+        title: Per-drive HDD temps (add your entities)
+        hours_to_show: 24
+        entities:
+          - entity: sensor.nas_hdd_max_temp
+          # - entity: sensor.nas_hdd_sda_temp

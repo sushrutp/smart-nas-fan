@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+"""nastemp-2 / admin center — neon control UI on :6767.
+
+Backend: FastAPI. Serves the dashboard, live status APIs, config editor.
+Auth: simple login form -> bearer token (ADMIN_USER / ADMIN_PASS env).
+Fan control itself stays on Proxmox (fan_controller.py); this app only
+monitors + edits config. No new inbound ports besides 6767.
+"""
+import glob
+import asyncio
+import io
+import csv
+import json
+import os
+import secrets
+import socket
+import sqlite3
+import time
+from datetime import datetime, timezone
+
+import requests
+import yaml
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+CFG_PATH = os.environ.get("NASTEMP_CONFIG", os.path.join(os.path.dirname(BASE), "config.yaml"))
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "nastemp")
+_tokens: set[str] = set()
+_auth = HTTPBearer(auto_error=False)
+
+app = FastAPI(title="nastemp admin", docs_url=None, redoc_url=None, openapi_url=None)
+
+
+def load_cfg():
+    with open(CFG_PATH) as f:
+        return yaml.safe_load(f)
+
+
+def check_auth(creds: HTTPAuthorizationCredentials = Depends(_auth)):
+    if creds is None or creds.credentials not in _tokens:
+        raise HTTPException(status_code=401, detail="login required")
+    return True
+
+
+# ---------- probes ----------
+
+def truenas_api(cfg):
+    """HDD temps via TrueNAS API. Returns dict with ok/temps/error/latency."""
+    t = cfg.get("truenas", {})
+    key = os.environ.get("TRUENAS_API_KEY") or t.get("api_key") or ""
+    if not key:
+        return {"ok": False, "error": "api_key missing"}
+    base = (t.get("api_url") or f"https://{t.get('host', '')}").rstrip("/")
+    verify = bool(t.get("verify_ssl", False))
+    if not verify:
+        requests.packages.urllib3.disable_warnings(
+            requests.packages.urllib3.exceptions.InsecureRequestWarning)
+    hdr = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    to = min(int(t.get("timeout_sec", 8)), 10)
+    t0 = time.time()
+    try:
+        q = requests.post(f"{base}/api/v2.0/disk.query", json=[],
+                          headers=hdr, timeout=to, verify=verify)
+        q.raise_for_status()
+        disks = q.json()
+        names = []
+        for d in disks if isinstance(disks, list) else []:
+            if not isinstance(d, dict) or not d.get("name"):
+                continue
+            dtype = (d.get("type") or "").upper()
+            if (t.get("hdd_only", True) and dtype == "HDD") or \
+               (not t.get("hdd_only", True)):
+                if not (t.get("hdd_only", True) and d["name"].startswith("nvme")):
+                    names.append(d["name"])
+            elif dtype == "" and d.get("rotationrate") is not None:
+                names.append(d["name"])
+        if not names:
+            return {"ok": False, "error": "no HDDs from disk.query", "latency_ms": int((time.time() - t0) * 1000)}
+        r = requests.post(f"{base}/api/v2.0/disk.temperatures", json=[names, False],
+                          headers=hdr, timeout=to, verify=verify)
+        r.raise_for_status()
+        raw = r.json() if isinstance(r.json(), dict) else {}
+        temps = {}
+        for n in names:
+            v = raw.get(n)
+            tv = float(v) if isinstance(v, (int, float)) else (
+                float(v["temperature"]) if isinstance(v, dict) and isinstance(v.get("temperature"), (int, float)) else None)
+            if tv is not None:
+                temps[f"/dev/{n}"] = round(tv, 1)
+        ms = int((time.time() - t0) * 1000)
+        if not temps:
+            return {"ok": False, "error": "no temps returned", "latency_ms": ms}
+        vals = list(temps.values())
+        return {"ok": True, "source": "api", "max": max(vals), "avg": round(sum(vals) / len(vals), 1),
+                "count": len(vals), "temps": temps, "latency_ms": ms}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:160], "latency_ms": int((time.time() - t0) * 1000)}
+
+
+def fan_hw():
+    """Read live PWM from sysfs (works in container with :ro hwmon mount)."""
+    for nf in glob.glob("/sys/class/hwmon/hwmon*/name"):
+        try:
+            with open(nf) as f:
+                if "it87" not in f.read():
+                    continue
+            base = os.path.dirname(nf)
+            for chan in ("pwm2", "pwm1"):
+                p = os.path.join(base, chan)
+                if os.path.exists(p):
+                    with open(p) as f:
+                        pwm = int(f.read().strip())
+                    rpm = None
+                    num = "".join(c for c in chan if c.isdigit())
+                    rp = os.path.join(base, f"fan{num}_input")
+                    if os.path.exists(rp):
+                        try:
+                            with open(rp) as f:
+                                rpm = int(f.read().strip())
+                        except Exception:
+                            pass
+                    return {"ok": True, "pwm": pwm, "pct": round(pwm / 2.55, 1), "rpm": rpm}
+        except Exception:
+            continue
+    return {"ok": False, "error": "no it87 pwm (native Proxmox only?)"}
+
+
+def heartbeat_age(cfg):
+    try:
+        with open(cfg["timing"]["heartbeat_file"]) as f:
+            return round(time.time() - float(f.read().strip()), 1)
+    except Exception:
+        return None
+
+
+def tcp_ok(host, port, timeout=3):
+    try:
+        t0 = time.time()
+        socket.create_connection((host, int(port)), timeout=timeout).close()
+        return {"ok": True, "latency_ms": int((time.time() - t0) * 1000)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120]}
+
+
+def db_last(db, limit=60):
+    try:
+        con = sqlite3.connect(db)
+        rows = con.execute(
+            "SELECT ts,max_temp,pwm,pct,action FROM readings ORDER BY ts DESC LIMIT ?",
+            (limit,)).fetchall()
+        ev = con.execute(
+            "SELECT ts,event,max_temp,pwm FROM events ORDER BY ts DESC LIMIT 10").fetchall()
+        con.close()
+        return {"ok": True,
+                "readings": [{"ts": r[0], "max": r[1], "pwm": r[2], "pct": r[3], "action": r[4]}
+                             for r in reversed(rows)],
+                "events": [{"ts": e[0], "event": e[1], "max": e[2], "pwm": e[3]} for e in ev]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120], "readings": [], "events": []}
+
+
+def boost_info(db_path):
+    """Last boosted (step_up/emergency) + last boosted-down (step_down/failsafe) for the ms timer."""
+    try:
+        con = sqlite3.connect(db_path)
+        up = con.execute(
+            "SELECT ts,event,max_temp,pwm FROM events WHERE event IN "
+            "('step_up','emergency','failsafe_maxboost_stepdown','maxboost_stepdown') "
+            "ORDER BY ts DESC LIMIT 1").fetchone()
+        dn = con.execute(
+            "SELECT ts,event,max_temp,pwm FROM events WHERE event IN "
+            "('step_down','failsafe_step_down') ORDER BY ts DESC LIMIT 1").fetchone()
+        con.close()
+        now_ms = int(time.time() * 1000)
+        active = bool(up and (not dn or up[0] > dn[0]))
+        return {"active": active,
+                "since_ts": up[0] if active else None,
+                "elapsed_ms": now_ms - int(datetime.fromisoformat(up[0]).timestamp() * 1000) if active else None,
+                "last_up": {"ts": up[0], "event": up[1], "max": up[2], "pwm": up[3]} if up else None,
+                "last_down": {"ts": dn[0], "event": dn[1], "max": dn[2], "pwm": dn[3]} if dn else None}
+    except Exception:
+        return {"active": False, "since_ts": None, "elapsed_ms": None, "last_up": None, "last_down": None}
+
+
+WMO_EMOJI = {0: "☀️", 1: "🌤️", 2: "⛅", 3: "☁️", 45: "🌫️", 48: "🌫️",
+             51: "🌦️", 53: "🌦️", 55: "🌦️", 56: "🌧️", 57: "🌧️",
+             61: "🌧️", 63: "🌧️", 65: "🌧️", 66: "🌧️", 67: "🌧️",
+             71: "❄️", 73: "❄️", 75: "❄️", 77: "❄️", 80: "🌧️", 81: "🌧️",
+             82: "🌧️", 85: "❄️", 86: "❄️", 95: "⛈️", 96: "⛈️", 99: "⛈️"}
+WMO_TEXT = {0: "clear sky", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
+            45: "fog", 48: "rime fog", 51: "light drizzle", 53: "drizzle", 55: "heavy drizzle",
+            61: "light rain", 63: "rain", 65: "heavy rain", 66: "freezing rain", 67: "freezing rain",
+            71: "light snow", 73: "snow", 75: "heavy snow", 77: "snow grains",
+            80: "light showers", 81: "showers", 82: "violent showers",
+            85: "snow showers", 86: "snow showers", 95: "thunderstorm",
+            96: "storm + hail", 99: "storm + hail"}
+_weather_cache: dict = {}
+
+
+def outside_weather(cfg):
+    """Ambient outside temp via Open-Meteo (free, no key). Cached 10 min."""
+    w = cfg.get("weather", {})
+    if not w.get("enabled", True):
+        return {"ok": None, "error": "disabled"}
+    now = time.time()
+    if _weather_cache.get("ts", 0) > now - 600 and _weather_cache.get("data"):
+        return _weather_cache["data"]
+    try:
+        pc, country = w.get("postcode", "33333"), w.get("country", "United States")
+        g = requests.get("https://geocoding-api.open-meteo.com/v1/search",
+                         params={"name": pc, "count": 5, "language": "en", "format": "json"},
+                         timeout=8).json()
+        place = None
+        for r in g.get("results", []):
+            if country.lower() in (r.get("country") or "").lower():
+                place = r
+                break
+        if not place:
+            top = (g.get("results") or [{}])[0]
+            return {"ok": False, "error": f"postcode {pc} not found in {country} "
+                    f"(top hit: {top.get('name', '?')}, {top.get('country', '?')}) — fix weather.postcode/country"}
+        f = requests.get("https://api.open-meteo.com/v1/forecast",
+                         params={"latitude": place["latitude"], "longitude": place["longitude"],
+                                 "current": "temperature_2m,weather_code", "timezone": "auto"},
+                         timeout=8).json()["current"]
+        code = int(f.get("weather_code", 3))
+        data = {"ok": True, "temp": f.get("temperature_2m"),
+                "emoji": WMO_EMOJI.get(code, "🌡️"), "text": WMO_TEXT.get(code, f"code {code}"),
+                "place": place.get("name", pc), "postcode": pc}
+        _weather_cache.update(ts=now, data=data)
+        return data
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120]}
+
+
+def build_status():
+    cfg = load_cfg()
+    t = cfg.get("truenas", {})
+    tn = truenas_api(cfg)
+    fan = fan_hw()
+    hb = heartbeat_age(cfg)
+    mq = cfg.get("mqtt", {})
+    mqtt = tcp_ok(mq.get("broker", ""), mq.get("port", 1883)) if mq.get("enabled") else {"ok": None, "error": "disabled"}
+    db_path = cfg["timing"].get("db_file", "/var/log/nastemp.db")
+    db = db_last(db_path, 60)
+    # fan state for UI color/animation
+    pct = fan.get("pct") if fan.get("ok") else (db["readings"][-1]["pct"] if db.get("readings") else None)
+    state = "unknown"
+    if pct is not None:
+        if pct <= 1:
+            state = "stopped"
+        elif pct <= 45:
+            state = "normal"
+        elif pct < 90:
+            state = "boost"
+        else:
+            state = "critical"
+    now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    return {
+        "ts": now,
+        "truenas": {**tn, "mode": t.get("method", "auto"), "host": t.get("host")},
+        "fan": {**fan, "pct": pct, "state": state,
+                "target": db["readings"][-1]["pwm"] if db.get("readings") else None},
+        "controller": {"heartbeat_age_s": hb, "alive": hb is not None and hb < 300},
+        "mqtt": {"ok": mqtt.get("ok"), "broker": mq.get("broker"),
+                 "error": mqtt.get("error"), "latency_ms": mqtt.get("latency_ms")},
+        "ntfy": {"enabled": cfg.get("ntfy", {}).get("enabled"),
+                 "last_event": db["events"][0] if db.get("events") else None},
+        "db": {"ok": db.get("ok"), "points": len(db.get("readings", []))},
+        "boost": boost_info(db_path),
+    }
+
+
+# ---------- routes ----------
+
+@app.get("/")
+def index():
+    return FileResponse(os.path.join(BASE, "index.html"))
+
+
+@app.post("/api/login")
+async def login(req: Request):
+    body = await req.json()
+    if secrets.compare_digest(str(body.get("user", "")), ADMIN_USER) and \
+       secrets.compare_digest(str(body.get("pass", "")), ADMIN_PASS):
+        tok = secrets.token_hex(16)
+        _tokens.add(tok)
+        return {"token": tok}
+    raise HTTPException(status_code=403, detail="bad credentials")
+
+
+@app.get("/api/status")
+def status(_: bool = Depends(check_auth)):
+    return build_status()
+
+
+@app.get("/stream")
+async def stream(token: str = ""):
+    """Realtime push over SSE (plain HTTP, auto-reconnect): status JSON every 2s."""
+    if token not in _tokens:
+        raise HTTPException(status_code=403, detail="login required")
+    async def gen():
+        while True:
+            try:
+                data = await asyncio.to_thread(build_status)
+                yield f"data: {json.dumps(data)}\n\n"
+            except Exception:
+                yield "event: error\ndata: {}\n\n"
+            await asyncio.sleep(2)
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/weather")
+def weather(_: bool = Depends(check_auth)):
+    return outside_weather(load_cfg())
+
+
+@app.get("/api/history")
+def history(limit: int = 120, _: bool = Depends(check_auth)):
+    cfg = load_cfg()
+    return db_last(cfg["timing"].get("db_file", "/var/log/nastemp.db"), limit=min(limit, 500))
+
+
+@app.get("/api/drives")
+def drives(limit: int = 120, _: bool = Depends(check_auth)):
+    """Per-drive temp series for multi-HDD graphs: {series: {sda: [{ts,temp}]}}."""
+    cfg = load_cfg()
+    db = cfg["timing"].get("db_file", "/var/log/nastemp.db")
+    try:
+        con = sqlite3.connect(db)
+        rows = con.execute(
+            """SELECT ts, drive, temp FROM drive_temps WHERE ts IN
+               (SELECT DISTINCT ts FROM drive_temps ORDER BY ts DESC LIMIT ?)
+               ORDER BY ts ASC""", (min(limit, 500),)).fetchall()
+        con.close()
+        series: dict[str, list] = {}
+        for ts, drv, temp in rows:
+            series.setdefault(drv.replace("/dev/", ""), []).append({"ts": ts, "temp": temp})
+        return {"ok": True, "series": series}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120], "series": {}}
+
+
+@app.get("/api/config")
+def get_config(_: bool = Depends(check_auth)):
+    with open(CFG_PATH) as f:
+        content = f.read()
+    return {"path": CFG_PATH, "content": content, "parsed": yaml.safe_load(content)}
+
+
+def _set_dotted(cfg, dotted, value):
+    parts = dotted.split(".")
+    node = cfg
+    for p in parts[:-1]:
+        if not isinstance(node.get(p), dict):
+            node[p] = {}
+        node = node[p]
+    node[parts[-1]] = value
+
+
+@app.post("/api/config")
+async def set_config(req: Request, _: bool = Depends(check_auth)):
+    body = await req.json()
+    with open(CFG_PATH) as f:
+        current = yaml.safe_load(f)
+    if "values" in body and isinstance(body["values"], dict):
+        # easy-form save: merge dotted keys into current yaml (structure preserved)
+        for k, v in body["values"].items():
+            _set_dotted(current, k, v)
+        content = yaml.safe_dump(current, sort_keys=False, default_flow_style=False)
+    else:
+        # raw YAML save
+        content = body.get("content", "")
+        try:
+            yaml.safe_load(content)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"invalid YAML: {e}")
+    os.rename(CFG_PATH, CFG_PATH + ".bak")
+    with open(CFG_PATH, "w") as f:
+        f.write(content if content.endswith("\n") else content + "\n")
+    return {"ok": True, "note": "saved. Restart controller to apply: docker compose restart controller (or systemctl restart nastemp-controller)."}
+
+
+def ov_path(cfg):
+    return cfg["timing"].get("override_file") or os.path.join(
+        os.path.dirname(cfg["timing"]["heartbeat_file"]), "override.json")
+
+
+def manual_state(cfg):
+    F, M = cfg["fan"], cfg.get("manual", {})
+    bounds = {"min": int(M.get("min_pwm", F["floor_pwm"])), "floor": F["floor_pwm"],
+              "ceiling": F["ceiling_pwm"], "max_sec": int(M.get("max_sec", 1800)),
+              "enabled": bool(M.get("enabled", True))}
+    try:
+        with open(ov_path(cfg)) as f:
+            o = json.load(f)
+        pwm = max(bounds["min"], min(255, int(o.get("manual_pwm", 0))))
+        until = float(o.get("until", 0))
+        if time.time() >= until:
+            return {**bounds, "active": False, "expired": True}
+        return {**bounds, "active": True, "pwm": pwm, "pct": round(pwm / 2.55, 1),
+                "until": until, "remaining_s": int(until - time.time()), "by": o.get("by", "?")}
+    except Exception:
+        return {**bounds, "active": False}
+
+
+@app.get("/api/manual")
+def get_manual(_: bool = Depends(check_auth)):
+    return manual_state(load_cfg())
+
+
+@app.post("/api/manual")
+async def set_manual(req: Request, _: bool = Depends(check_auth)):
+    """Slider/preset control: {pwm, seconds?, by?} or {auto:true} to release."""
+    body = await req.json()
+    cfg = load_cfg()
+    if body.get("auto"):
+        try:
+            os.remove(ov_path(cfg))
+        except Exception:
+            pass
+        return {**manual_state(cfg), "active": False}
+    M = cfg.get("manual", {})
+    lo = int(M.get("min_pwm", cfg["fan"]["floor_pwm"]))
+    pwm = max(lo, min(255, int(body.get("pwm", lo))))
+    secs = max(60, min(int(M.get("max_sec", 1800)), int(body.get("seconds", M.get("max_sec", 1800)))))
+    p = ov_path(cfg)
+    d = os.path.dirname(p)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(p, "w") as f:
+        json.dump({"manual_pwm": pwm, "until": time.time() + secs,
+                   "by": str(body.get("by", "admin-ui"))[:40]}, f)
+    st = manual_state(cfg)
+    st["note"] = (f"Manual PWM {pwm} ({round(pwm/2.55,1)}%) for {secs//60}min. "
+                  "Auto-expires, critical temps still win.")
+    return st
+
+
+@app.get("/api/export")
+def export(kind: str = "readings", limit: int = 2000, _: bool = Depends(check_auth)):
+    """CSV download (opens in Excel): kind=readings|events."""
+    cfg = load_cfg()
+    db = cfg["timing"].get("db_file", "/var/log/nastemp.db")
+    if kind == "events":
+        header = ["ts", "event", "max_temp", "pwm", "why"]
+        sql = "SELECT ts,event,max_temp,pwm,why FROM events ORDER BY ts DESC LIMIT ?"
+    else:
+        kind = "readings"
+        header = ["ts", "source", "max_temp", "avg_temp", "target", "pwm", "pct", "rpm", "action", "why"]
+        sql = "SELECT ts,source,max_temp,avg_temp,target,pwm,pct,rpm,action,why FROM readings ORDER BY ts DESC LIMIT ?"
+    try:
+        con = sqlite3.connect(db)
+        try:
+            rows = con.execute(sql, (min(limit, 5000),)).fetchall()
+        except sqlite3.OperationalError:
+            rows = []  # DB exists but controller hasn't logged yet -> header-only CSV
+        con.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:160])
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(header)
+    w.writerows(rows)
+    return Response(content=buf.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition": f"attachment; filename=nastemp-{kind}.csv"})
+
+
+@app.get("/api/logs")
+def logs(lines: int = 120, _: bool = Depends(check_auth)):
+    cfg = load_cfg()
+    try:
+        with open(cfg["timing"]["log_file"]) as f:
+            tail = f.readlines()[-min(lines, 500):]
+        return {"ok": True, "lines": tail}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:160], "lines": []}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=6767)
