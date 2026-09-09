@@ -89,6 +89,9 @@ ntfy flash on new event, shared-axis chart (🌡️ temp + 🌀 fan% + 🔔 ntfy
 - **🎛️ Manual fan control card**: slider (live ≤5s) + ⬆️/⬇️ ±10 + 🔥 boost (ceiling) +
   🟢 quiet (floor) + 🤖 auto-release. Safety: auto-expires (`manual.max_sec`),
   never below floor, 🌡️ critical always wins, `fan/mode` topic for HA. Disabled in demo.
+- **🖥️ Host metrics + 💽 array I/O**: CPU/RAM gauges for Proxmox + TrueNAS (via
+  `reporting.get_data`), live read/write MB/s (heavy scrub/backup explains temp spikes).
+- **📨 Send Test Alert** button in the ntfy card verifies the push pipeline on demand.
 
 ```bash
 ADMIN_USER=me ADMIN_PASS='s3cret!' docker compose up -d --build admin

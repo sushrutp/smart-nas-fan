@@ -135,6 +135,7 @@ canvas{width:100%;height:260px;background:#060918f2;border:1px solid var(--line)
 <header>
   <h1>🌀 nastemp-2</h1>
   <span id="clock">--:--:--.---</span>
+  <span id="ver" class="dim mono"></span>
   <span id="modeBadge" class="modebadge">● LIVE</span>
   <span class="sp"></span>
   <div class="seg"><button id="mLive" class="on">● live</button><button id="mDemo">▶ demo</button></div>
@@ -223,6 +224,10 @@ canvas{width:100%;height:260px;background:#060918f2;border:1px solid var(--line)
       <h2>🔔 ntfy — flashes on event</h2>
       <div id="ntfyState" class="pill">…</div>
       <div id="ntfyLast" class="dim mono" style="margin-top:8px">last event: –</div>
+      <div class="row" style="margin-top:10px">
+        <button id="ntfyTest">📨 Send Test Alert</button>
+        <span id="ntfyTestRes" class="dim"></span>
+      </div>
     </div>
     <div class="card">
       <h2>🌍 outside <span id="wPc" class="mono"></span></h2>
@@ -250,6 +255,17 @@ canvas{width:100%;height:260px;background:#060918f2;border:1px solid var(--line)
   <div class="grid">
     <div class="card"><h2>🧠 controller</h2><div id="ctrlBox">…</div></div>
     <div class="card"><h2>📜 logs</h2><div id="logs">…</div></div>
+    <div class="card">
+      <h2>🖥️ host metrics — CPU / RAM</h2>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px" id="gauges"></div>
+      <div class="dim mono" id="hostNote" style="margin-top:8px"></div>
+    </div>
+    <div class="card">
+      <h2>💽 array I/O — live throughput</h2>
+      <div class="big">⬇️ <span id="ioR">–</span><span class="dim"> MB/s</span></div>
+      <div class="big">⬆️ <span id="ioW">–</span><span class="dim"> MB/s</span></div>
+      <div class="dim" id="ioNote" style="margin-top:8px">heavy scrub/backup? explains temp spikes</div>
+    </div>
   </div>
 </main>
 
@@ -274,7 +290,7 @@ document.getElementById('loginForm').onsubmit = async e => {
   const r = await fetch('/api/login', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({user: document.getElementById('u').value, pass: document.getElementById('p').value})});
   if (r.ok) { TOK = (await r.json()).token; sessionStorage.setItem('ntok', TOK);
-    document.getElementById('login').style.display = 'none'; connectStream(); tick(); chart(); fetchWeather(); }
+    document.getElementById('login').style.display = 'none'; connectStream(); tick(); chart(); fetchWeather(); fetchHost(); }
   else document.getElementById('loginErr').textContent = '❌ wrong credentials';
 };
 document.getElementById('logoutBtn').onclick = () => { sessionStorage.removeItem('ntok'); location.reload(); };
@@ -324,7 +340,7 @@ function connectStream() {
 $('mLive').onclick = () => { DEMO = false; $('mLive').classList.add('on'); $('mDemo').classList.remove('on');
   const b = $('modeBadge'); b.textContent = '● LIVE'; b.classList.remove('demo');
   $('manualCard').style.opacity = 1; $('manualCard').querySelectorAll('input,button').forEach(el => el.disabled = false);
-  connectStream(); tick(); chart(); fetchManual(); };
+  connectStream(); tick(); chart(); fetchManual(); fetchHost(); };
 $('mDemo').onclick = () => { DEMO = true; simReset(); try { ES && ES.close(); } catch (e) {}
   $('mDemo').classList.add('on'); $('mLive').classList.remove('on');
   const b = $('modeBadge'); b.textContent = '▶ DEMO'; b.classList.add('demo');
@@ -419,6 +435,7 @@ function setFan(pct, state, pwm, rpm) {
 
 function render(s) {
   window._lastPct = s.fan.pct;
+  if (s.version && !$('ver').textContent) $('ver').textContent = 'v' + s.version;
   $('e_tru_lbl').textContent = s.truenas.ok ? (s.truenas.max + '°C') : '✖';
   $('e_tru_ms').textContent = s.truenas.ok && s.truenas.latency_ms != null ? `⚡${s.truenas.latency_ms}ms` : '';
   $('e_mqtt_ms').textContent = s.mqtt.ok && s.mqtt.latency_ms != null ? `⚡${s.mqtt.latency_ms}ms` : '';
@@ -632,6 +649,66 @@ $('chart').addEventListener('mousemove', e => {
 });
 $('chart').addEventListener('mouseleave', () => { $('tip').style.display = 'none'; chart(); });
 
+/* ---------- host metrics gauges + array I/O ---------- */
+function gauge(label, icon, v) {
+  const C = (2 * Math.PI * 34).toFixed(1);
+  const col = v == null ? '#4a5070' : v < 60 ? '#39ff88' : v < 85 ? '#ff9f1c' : '#ff2d6f';
+  const frac = v == null ? 0 : Math.min(100, v) / 100;
+  return `<div style="text-align:center"><svg width="86" height="86" viewBox="0 0 86 86">`
+    + `<circle cx="43" cy="43" r="34" fill="none" stroke="#1e2450" stroke-width="8"/>`
+    + `<circle cx="43" cy="43" r="34" fill="none" stroke="${col}" stroke-width="8" stroke-linecap="round" `
+    + `stroke-dasharray="${(C * frac).toFixed(1)} ${C}" transform="rotate(-90 43 43)" style="filter:drop-shadow(0 0 5px ${col})"/>`
+    + `<text x="43" y="49" text-anchor="middle" fill="${col}" font-size="15" font-weight="700" font-family="JetBrains Mono,monospace">${v == null ? '–' : v + '%'}</text></svg>`
+    + `<div class="dim" style="margin-top:2px">${icon} ${label}</div></div>`;
+}
+function renderHost(h) {
+  const p = (h && h.proxmox) || {}, t = (h && h.truenas) || {};
+  $('gauges').innerHTML = gauge('Prox CPU', '🖥️', p.cpu) + gauge('Prox RAM', '🧠', p.ram)
+    + gauge('NAS CPU', '🗄️', t.cpu) + gauge('NAS RAM', '🧠', t.ram);
+  const bits = [];
+  if (p.ram_used_gb != null) bits.push(`prox ${p.ram_used_gb}GB used`);
+  if (!p.ok) bits.push('prox: ' + (p.error || '?'));
+  if (!t.ok && t.error) bits.push('nas: ' + t.error);
+  $('hostNote').textContent = bits.join(' · ') || '–';
+  const r = t.read_mbs, w = t.write_mbs;
+  $('ioR').textContent = r == null ? '–' : r;
+  $('ioW').textContent = w == null ? '–' : w;
+  $('ioNote').textContent = r == null ? ('⚪ ' + (t.error || 'no data'))
+    : ((r > 20 || w > 20) ? '🔥 heavy I/O — likely explains temp spikes (scrub/backup?)' : '✅ array idle');
+}
+const demoH = {pc: 24, pr: 58, tc: 14, tr: 44};
+function simHost() {
+  const w = () => (Math.random() - .5) * 5;
+  demoH.pc = Math.max(4, Math.min(96, demoH.pc + w()));
+  demoH.pr = Math.max(20, Math.min(95, demoH.pr + w() * .5));
+  demoH.tc = Math.max(3, Math.min(96, demoH.tc + w()));
+  demoH.tr = Math.max(20, Math.min(95, demoH.tr + w() * .5));
+  const cyc = sim.t % 120, heat = cyc < 24 ? cyc / 24 : 0; // I/O surge feeds the heat wave
+  return {proxmox: {ok: true, cpu: +demoH.pc.toFixed(1), ram: +demoH.pr.toFixed(1)},
+    truenas: {ok: true, cpu: +demoH.tc.toFixed(1), ram: +demoH.tr.toFixed(1),
+      read_mbs: +(3 + heat * 48 + Math.random() * 3).toFixed(1),
+      write_mbs: +(1 + heat * 22 + Math.random() * 2).toFixed(1)}};
+}
+async function fetchHost() {
+  if (!TOK) return;
+  if (DEMO) { renderHost(simHost()); return; }
+  try {
+    const h = await (await fetch('/api/hostmetrics', {headers: H()})).json();
+    renderHost(h);
+  } catch (e) {}
+}
+$('ntfyTest').onclick = async () => {
+  $('ntfyTestRes').textContent = 'sending…';
+  try {
+    const r = await fetch('/api/ntfy-test', {method: 'POST', headers: {...H(), 'Content-Type': 'application/json'}, body: '{}'});
+    const j = await r.json().catch(() => ({}));
+    if (r.ok) {
+      $('ntfyTestRes').textContent = `✅ pushed in ${j.ms}ms — check your phone 📱`;
+      const cc = $('ntfyCard'); cc.classList.remove('flash'); void cc.offsetWidth; cc.classList.add('flash');
+    } else $('ntfyTestRes').textContent = `❌ ${j.detail || 'failed'}`;
+  } catch (e) { $('ntfyTestRes').textContent = '❌ network error'; }
+};
+
 /* ---------- CSV export (opens in Excel) ---------- */
 async function dl(kind) {
   const r = await fetch(`/api/export?kind=${kind}&limit=5000`, {headers: H()});
@@ -790,8 +867,9 @@ $('cfgSave').onclick = async () => {
   const j = await r.json();
   $('cfgMsg').textContent = r.ok ? '✅ ' + j.note : '❌ ' + (j.detail || 'error');
 };
-setInterval(tick, 3000); setInterval(() => { chart(); fetchManual(); }, 10000); setInterval(fetchWeather, 60000);
-tick(); chart(); fetchWeather(); fetchManual();
+setInterval(tick, 3000); setInterval(() => { chart(); fetchManual(); }, 10000);
+setInterval(fetchWeather, 60000); setInterval(fetchHost, 15000);
+tick(); chart(); fetchWeather(); fetchManual(); fetchHost();
 </script>
 </body>
 </html>

@@ -26,6 +26,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 CFG_PATH = os.environ.get("NASTEMP_CONFIG", os.path.join(os.path.dirname(BASE), "config.yaml"))
+try:
+    with open(os.path.join(os.path.dirname(BASE), "VERSION")) as _vf:
+        VERSION = _vf.read().strip()
+except Exception:
+    VERSION = "1.0"
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "nastemp")
 _tokens: set[str] = set()
@@ -261,6 +266,7 @@ def build_status():
     now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     return {
         "ts": now,
+        "version": VERSION,
         "truenas": {**tn, "mode": t.get("method", "auto"), "host": t.get("host")},
         "fan": {**fan, "pct": pct, "state": state,
                 "target": db["readings"][-1]["pwm"] if db.get("readings") else None},
@@ -272,6 +278,98 @@ def build_status():
         "db": {"ok": db.get("ok"), "points": len(db.get("readings", []))},
         "boost": boost_info(db_path),
     }
+
+
+def _tn_req(cfg, method, params, timeout=12):
+    """TrueNAS REST helper shared by metrics calls (api key + https + self-signed)."""
+    t = cfg.get("truenas", {})
+    key = os.environ.get("TRUENAS_API_KEY") or t.get("api_key") or ""
+    if not key:
+        raise RuntimeError("api_key missing")
+    base = (t.get("api_url") or f"https://{t.get('host', '')}").rstrip("/")
+    verify = bool(t.get("verify_ssl", False))
+    if not verify:
+        requests.packages.urllib3.disable_warnings(
+            requests.packages.urllib3.exceptions.InsecureRequestWarning)
+    r = requests.post(f"{base}/api/v2.0/{method}", json=params,
+                      headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                      timeout=timeout, verify=verify)
+    r.raise_for_status()
+    return r.json()
+
+
+def proxmox_host():
+    """Lightweight CPU% + RAM% of the box running this UI (Proxmox/Docker host). Stdlib only."""
+    try:
+        def times():
+            with open("/proc/stat") as f:
+                return list(map(int, f.readline().split()[1:8]))
+        a, t0 = times(), time.time()
+        time.sleep(0.4)
+        b = times()
+        idle = (b[3] + b[4]) - (a[3] + a[4])
+        cpu = round(100 * (1 - idle / max(1, sum(b) - sum(a))), 1)
+        mem = {}
+        with open("/proc/meminfo") as f:
+            for ln in f:
+                k, v = ln.split(":")
+                mem[k] = int(v.split()[0])
+        avail = mem.get("MemAvailable", mem["MemFree"])
+        ram = round(100 * (1 - avail / mem["MemTotal"]), 1)
+        return {"ok": True, "cpu": cpu, "ram": ram,
+                "ram_used_gb": round((mem["MemTotal"] - avail) / 1048576, 1),
+                "sample_s": round(time.time() - t0, 2)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:100]}
+
+
+_metrics_cache: dict = {}
+
+
+def truenas_metrics(cfg):
+    """TrueNAS CPU% + RAM% + array read/write MB/s via reporting.get_data. Cached 30s."""
+    now = time.time()
+    if _metrics_cache.get("ts", 0) > now - 30 and _metrics_cache.get("data"):
+        return _metrics_cache["data"]
+    try:
+        out = _tn_req(cfg, "reporting/get_data", {
+            "graphs": [{"name": "cpu"}, {"name": "memory"}, {"name": "disk"}],
+            "reporting_query": {"unit": "HOUR", "page": 0, "aggregate": True}}, timeout=15)
+        graphs = {g.get("name"): g for g in (out if isinstance(out, list) else [])}
+
+        def vals(g):
+            if not isinstance(g, dict):
+                return [], []
+            leg = [str(x).lower() for x in g.get("legend", [])]
+            agg = (g.get("aggregations") or {}).get("mean") or []
+            if agg:
+                return leg, [float(v) for v in agg]
+            data = g.get("data") or []
+            return leg, [float(v) for v in data[-1]] if data else []
+
+        res = {"ok": True}
+        leg, v = vals(graphs.get("cpu"))
+        if v and sum(v) > 0:
+            idle = v[leg.index("idle")] if "idle" in leg else v[-1]
+            res["cpu"] = round(100 * (sum(v) - idle) / sum(v), 1)
+        leg, v = vals(graphs.get("memory"))
+        if v and sum(v) > 0:
+            used = v[leg.index("used")] if "used" in leg else v[0]
+            res["ram"] = round(100 * used / sum(v), 1)
+        leg, v = vals(graphs.get("disk"))
+        data = (graphs.get("disk") or {}).get("data") or []
+        last = [float(x) for x in data[-1]] if data else v  # live point, not hourly mean
+        if last:
+            ri = leg.index("read") if "read" in leg else 0
+            wi = leg.index("write") if "write" in leg else (1 if len(last) > 1 else 0)
+            res["read_mbs"] = round(max(0, last[ri]) / 1048576, 1)
+            res["write_mbs"] = round(max(0, last[wi]) / 1048576, 1)
+        if len(res) == 1:
+            return {"ok": False, "error": "no metric parsed"}
+        _metrics_cache.update(ts=now, data=res)
+        return res
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:140]}
 
 
 # ---------- routes ----------
@@ -439,6 +537,30 @@ async def set_manual(req: Request, _: bool = Depends(check_auth)):
     st["note"] = (f"Manual PWM {pwm} ({round(pwm/2.55,1)}%) for {secs//60}min. "
                   "Auto-expires, critical temps still win.")
     return st
+
+
+@app.get("/api/hostmetrics")
+def hostmetrics(_: bool = Depends(check_auth)):
+    cfg = load_cfg()
+    return {"proxmox": proxmox_host(), "truenas": truenas_metrics(cfg)}
+
+
+@app.post("/api/ntfy-test")
+async def ntfy_test(req: Request, _: bool = Depends(check_auth)):
+    """Send Test Alert button: verifies the whole push pipeline on demand."""
+    body = await req.json() if req.headers.get("content-type", "").startswith("application/json") else {}
+    cfg = load_cfg()
+    n = cfg.get("ntfy", {})
+    if not n.get("enabled") or not n.get("url"):
+        raise HTTPException(status_code=400, detail="ntfy not configured")
+    msg = str((body or {}).get("message") or "🔔 nastemp TEST alert — push pipeline OK ✅")
+    t0 = time.time()
+    try:
+        requests.post(n["url"], data=msg.encode("utf-8"), timeout=8,
+                      headers={"Title": "nastemp test", "Priority": "high", "Tags": "bell,test"})
+        return {"ok": True, "ms": int((time.time() - t0) * 1000)}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e)[:160])
 
 
 @app.get("/api/export")
