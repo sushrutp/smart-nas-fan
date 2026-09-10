@@ -22,6 +22,7 @@ Failsafe layers:
 import glob
 import json
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -44,7 +45,26 @@ CFG_PATH = os.environ.get("NASTEMP_CONFIG", os.path.join(os.path.dirname(os.path
 
 def load_cfg(path):
     with open(path) as f:
-        return yaml.safe_load(f)
+        return _expand_env(yaml.safe_load(f))
+
+_ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+def _expand_env(obj):
+    """Secrets live in env/.env, never in files: expands $VAR / ${VAR} / ${VAR:-default}."""
+    if isinstance(obj, dict):
+        return {k: _expand_env(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_expand_env(v) for v in obj]
+    if isinstance(obj, str):
+        def sub(m):
+            if m.group(3) is not None:  # $VAR -> "" if unset/empty
+                return os.environ.get(m.group(3), "")
+            v = os.environ.get(m.group(1))  # ${VAR} / ${VAR:-default}
+            if v:
+                return v
+            return m.group(2) if m.group(2) is not None else ""
+        return _ENV_RE.sub(sub, obj)
+    return obj
 
 def log_line(cfg, msg):
     ts = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -499,7 +519,7 @@ class Pub:
 
 def ntfy(cfg, msg, title="nastemp", priority="default", tags=""):
     n = cfg.get("ntfy", {})
-    if not n.get("enabled"):
+    if not n.get("enabled") or not n.get("url"):
         return
     try:
         requests.post(n["url"], data=msg.encode("utf-8"), timeout=8,

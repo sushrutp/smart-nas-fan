@@ -15,13 +15,14 @@ Fan control NEVER leaves Proxmox. Everything else is poll (outbound) or publish 
 
 ## 1. What you must generate BEFORE install (checklist)
 
-| # | Needed | How to generate | Example | Where it goes |
+| # | Needed | How to generate | Example | Where it goes (.env, NEVER in files) |
 |---|---|---|---|---|
-| 1 | **TrueNAS API key** (HDD temps, primary) | TrueNAS UI → Credentials → API Keys → Add → name `nastemp-monitor` → Copy key ONCE (needs `REPORTING_READ` or admin) | `1-abc...xyz` | `config.yaml: truenas.api_url: "https://192.168.1.10"`, `truenas.api_key: "<key>"` (or env `TRUENAS_API_KEY=<key>` — safer for Docker) |
-| 2 | **TrueNAS SSH key** (fallback when API down) | On Proxmox: `ssh-keygen -t ed25519 -N ""` then `ssh-copy-id admin@192.168.1.10` | `/root/.ssh/id_ed25519` | `config.yaml: truenas.host/user/key_path`. Docker: host `~/.ssh` auto-mounted to `/root/.ssh` |
-| 3 | **MQTT broker address + login** | HA → Settings → Add-ons → Mosquitto broker → note IP/port/user/pass (or existing broker) | `192.168.1.5:1883` user/pass | `config.yaml: mqtt.broker/port/username/password` |
-| 4 | **ntfy topic URL** (the "token" — secret URL) | Self-hosted: pick `http://192.168.1.5:8080/nastemp`. Public: `https://ntfy.sh/<pick-unguessable-name>`. Test: `curl -d "test" <URL>` → check phone/web app subscribed to same topic | `http://192.168.1.5:8080/nastemp` | `config.yaml: ntfy.url`. Subscribe same topic in ntfy phone app / web |
-| 5 | (Optional) HA long history | Nothing to generate — just config | `purge_keep_days: 30` | HA `configuration.yaml` → `recorder:` (see README §6.3) |
+| 1 | **TrueNAS API key** (HDD temps, primary) | TrueNAS UI → Credentials → API Keys → Add → name `nastemp-monitor` → Copy key ONCE (needs `REPORTING_READ` or admin) | `1-abc...xyz` | `.env: TRUENAS_API_KEY=<key>` (+ `TRUENAS_HOST`, `TRUENAS_API_URL` — or keep IPs in config) |
+| 2 | **TrueNAS SSH key** (fallback when API down) | On Proxmox: `ssh-keygen -t ed25519 -N ""` then `ssh-copy-id admin@192.168.1.10` | `/root/.ssh/id_ed25519` | Key files on disk (0600); `truenas.key_path` in config. Docker: host `~/.ssh` auto-mounted to `/root/.ssh` |
+| 3 | **MQTT broker login** | HA → Settings → Add-ons → Mosquitto broker → note user/pass | user/pass | `.env: MQTT_BROKER / MQTT_USER / MQTT_PASSWORD` |
+| 4 | **ntfy topic URL** (the "token" — secret URL) | Self-hosted: pick `http://192.168.1.5:8080/nastemp`. Public: `https://ntfy.sh/<pick-unguessable-name>`. Test: `curl -d "test" <URL>` → check phone/web app subscribed to same topic | `http://192.168.1.5:8080/nastemp` | `.env: NTFY_URL=<url>`. Subscribe same topic in ntfy phone app / web |
+| 5 | **Admin login** | You invent it (`setup.sh` generates one if you don't) | `me` / strong pass | `.env: ADMIN_USER / ADMIN_PASS` (compose refuses to start without it) |
+| 6 | (Optional) HA long history | Nothing to generate — just config | `purge_keep_days: 30` | HA `configuration.yaml` → `recorder:` (see README §6.3) |
 
 No Proxmox token, no Docker token, no HA token needed.
 
@@ -75,8 +76,8 @@ systemctl status nastemp-controller nastemp-watchdog
 ```bash
 cd nastemp-2
 mkdir -p logs
-nano config.yaml   # same §1 edits; key_path: "/root/.ssh/id_ed25519"
-# safer: export TRUENAS_API_KEY="1-abc...xyz"  (instead of writing key in file)
+cp .env.example .env && nano .env   # <-- secrets FIRST (compose fails fast without ADMIN_PASS)
+nano config.yaml   # non-secret tuning only; secrets come from .env
 docker compose up -d --build
 docker compose logs -f controller
 docker compose logs -f watchdog
@@ -115,8 +116,9 @@ ntfy flash on new event, shared-axis chart (🌡️ temp + 🌀 fan% + 🔔 ntfy
 - **📨 Send Test Alert** button in the ntfy card verifies the push pipeline on demand.
 
 ```bash
-ADMIN_USER=me ADMIN_PASS='s3cret!' docker compose up -d --build admin
-# open: http://<docker-host-ip>:6767
+cp .env.example .env && nano .env   # ADMIN_PASS required; TRUENAS_API_KEY, MQTT_*, NTFY_URL
+docker compose up -d --build admin
+# open: http://<docker-host-ip>:6767  (login with ADMIN_USER / ADMIN_PASS from .env)
 ```
 
 - Login with those credentials (defaults `admin` / `nastemp` — change them!).

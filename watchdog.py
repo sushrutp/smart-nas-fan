@@ -64,7 +64,7 @@ def main():
                     last_forced = time.time()
                     # try ntfy if configured via env (optional)
                     import urllib.request
-                    url = os.environ.get("NASTEMP_NTFY")
+                    url = os.environ.get("NASTEMP_NTFY") or os.environ.get("NTFY_URL")
                     if url:
                         try:
                             req = urllib.request.Request(

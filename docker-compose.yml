@@ -9,13 +9,13 @@
 #   ./logs/                -> nastemp.log + nastemp.jsonl + nastemp.db (persisted)
 #   heartbeat volume       -> shared /run/nastemp between all containers
 #
-# Start:  docker compose up -d --build
+# Secrets live in `.env` (copy `.env.example`), NEVER in this file.
+# Compose auto-loads `./.env`. Start:
+#   cp .env.example .env && nano .env   # fill secrets first!
+#   docker compose up -d --build
 # Logs:   docker compose logs -f controller
 #         docker compose logs -f watchdog
-# UI:     http://<host>:6767  (ADMIN_USER / ADMIN_PASS, defaults admin/nastemp)
-#
-# Change admin password without editing compose:
-#   ADMIN_USER=me ADMIN_PASS='s3cret!' docker compose up -d admin
+# UI:     http://<host>:6767  (login with ADMIN_USER / ADMIN_PASS from .env)
 
 services:
   controller:
@@ -27,6 +27,15 @@ services:
     restart: unless-stopped
     environment:
       NASTEMP_CONFIG: /config/config.yaml
+      # Secrets from .env (see .env.example) — expanded inside config.yaml:
+      TRUENAS_HOST: ${TRUENAS_HOST:-}
+      TRUENAS_API_URL: ${TRUENAS_API_URL:-}
+      TRUENAS_API_KEY: ${TRUENAS_API_KEY:-}
+      TRUENAS_USER: ${TRUENAS_USER:-}
+      MQTT_BROKER: ${MQTT_BROKER:-}
+      MQTT_USER: ${MQTT_USER:-}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+      NTFY_URL: ${NTFY_URL:-}
       TZ: ${TZ:-UTC}
     volumes:
       - ./config.yaml:/config/config.yaml:ro
@@ -69,15 +78,11 @@ services:
     environment:
       NASTEMP_CONFIG: /config/config.yaml
       ADMIN_USER: ${ADMIN_USER:-admin}
-      ADMIN_PASS: ${ADMIN_PASS:-nastemp}
+      ADMIN_PASS: ${ADMIN_PASS:?set ADMIN_PASS in .env (no default password)}
       TRUENAS_API_KEY: ${TRUENAS_API_KEY:-}
       # Remote mode (GUI on another VM/host, Proxmox reached over IP via SSH key):
-      # Copy the admin service to your other host, then set:
-      # PROXMOX_HOST: 192.168.1.2      # Proxmox IP — empty = local mode
-      # PROXMOX_USER: root
-      # PROXMOX_PORT: 22               # custom SSH port if yours differs
-      # PROXMOX_KEY: /root/.ssh/id_ed25519
-      # PROXMOX_CONFIG: /opt/nastemp/config.yaml   # controller config ON proxmox
+      # Set these in .env instead of editing here:
+      # PROXMOX_HOST, PROXMOX_USER, PROXMOX_PORT, PROXMOX_KEY, PROXMOX_CONFIG
       TZ: ${TZ:-UTC}
     volumes:
       # rw so the UI config editor can save (controller mounts the same file ro):

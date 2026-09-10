@@ -39,8 +39,7 @@ ADMIN_USER=me ADMIN_PASS='s3cret!' docker compose up -d --build admin
 
 ```bash
 sudo bash setup.sh   # installs controller + watchdog + admin (venv + systemd unit)
-nano /etc/systemd/system/nastemp-admin.service   # set ADMIN_USER / ADMIN_PASS !!
-sudo systemctl daemon-reload
+# setup.sh writes secrets to /opt/nastemp/nastemp.env (0600), generates ADMIN_PASS if unset
 sudo systemctl start nastemp-admin
 ```
 
@@ -53,6 +52,9 @@ ssh-copy-id -i ~/.ssh/id_proxmox root@192.168.1.2
 PROXMOX_HOST=192.168.1.2 PROXMOX_USER=root docker compose up -d --build admin
 ```
 
+> First: `cp .env.example .env && nano .env` — `ADMIN_PASS` is required (compose
+> fails fast without it); also fill `TRUENAS_API_KEY`, `MQTT_*`, `NTFY_URL`.
+
 ### D. Native on another VM/host, no Docker (remote mode)
 
 ```bash
@@ -61,11 +63,16 @@ PROXMOX_HOST=192.168.1.2 PROXMOX_USER=root PROXMOX_CONFIG=/opt/nastemp/config.ya
   python3 -m uvicorn app:app --host 0.0.0.0 --port 6767 --app-dir ./admin
 ```
 
-## Configuration (all via environment)
+## Configuration (all via environment — nothing hardcoded)
+
+Secrets live in **`.env`** (root dir, gitignored — copy `.env.example`), native systemd
+reads **`/opt/nastemp/nastemp.env`** (0600, written by `setup.sh`). `config.yaml` only
+holds `${VAR}` / `${VAR:-default}` placeholders, expanded at load.
 
 | Var | Default | Needed when | What it does |
 |---|---|---|---|
-| `ADMIN_USER` / `ADMIN_PASS` | `admin` / `nastemp` | **always — change them!** | Login form → bearer token for all `/api/*` |
+| `ADMIN_USER` | `admin` | login name | Login form user |
+| `ADMIN_PASS` | **none — required** | **always** | Login password. Compose fails fast without it; `setup.sh` generates one and prints it once |
 | `NASTEMP_CONFIG` | `/config/config.yaml` (docker) / `../config.yaml` | local mode | Controller config file the editor reads/writes |
 | `TRUENAS_API_KEY` | — (else `truenas.api_key` from config) | TrueNAS temps/metrics | Bearer token, safer than writing it in the file |
 | `PROXMOX_HOST` | empty (= local mode) | remote mode | Proxmox IP — **this one switch** selects remote |
