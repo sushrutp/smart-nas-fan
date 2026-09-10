@@ -124,6 +124,15 @@ at 97ms on any transport.
 Security: keep `:6767` LAN-only behind your firewall, set a strong `ADMIN_PASS`,
 prefer `TRUENAS_API_KEY` env over writing the key into the config file.
 
+Threat model (public repo, homelab use): API keys/passwords live ONLY in `.env` /
+`nastemp.env` (both gitignored — verified, no `.env` or key files are tracked, and the
+full git history was scanned). Debug logs mask secrets (`***lenN`). Bearer tokens are
+32-hex random, `compare_digest`-checked, and **expire after 12h** (SSE `?token=` URLs
+land in access logs — expiry bounds that leak). UI escapes all dynamic strings.
+Treat any authenticated UI session as root-equivalent (config write + fan override),
+so guard `ADMIN_PASS` like one. SSH to Proxmox uses key auth + `AutoAddPolicy`
+(TLS-grade inside your LAN; use `verify_ssl: true` with a real cert if you have one).
+
 ## Debug logging (what is it connecting to?)
 
 Off by default. Turn on with `ADMIN_DEBUG=1` (or `NASTEMP_DEBUG=1`) on the admin,

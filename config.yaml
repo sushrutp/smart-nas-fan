@@ -76,7 +76,7 @@ mqtt:
 ntfy:
   enabled: true
   url: "${NTFY_URL}"  # <-- SECRET-ish (topic URL is a bearer secret): set in .env
-  # e.g. "https://ntfy.sh/my-secret-topic-xyz" or "http://192.168.1.5:8080/nastemp"
+  # e.g. "https://ntfy.sh/YOUR-UNGUESSABLE-TOPIC-HERE" or "http://192.168.1.5:8080/nastemp"
   on_step_up: true
   on_step_down: false     # set true if you want down-notify (noisy)
   on_failsafe: true

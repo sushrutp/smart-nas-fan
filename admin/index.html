@@ -297,6 +297,7 @@ document.getElementById('loginForm').onsubmit = async e => {
 document.getElementById('logoutBtn').onclick = () => { sessionStorage.removeItem('ntok'); location.reload(); };
 const H = () => ({'Authorization': 'Bearer ' + TOK});
 const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 
 /* ms clock + boosted-since ms timer */
 const pad = (n, l=2) => String(n).padStart(l, '0');
@@ -472,7 +473,7 @@ function render(s) {
     $('tAvg').textContent = `avg ${s.truenas.avg}°C · max ${s.truenas.max}°C · n=${s.truenas.count} · src ${s.truenas.source || ''} · ${s.truenas.latency_ms ?? ''}ms`;
     $('tList').innerHTML = Object.entries(s.truenas.temps || {}).map(([k, v]) => {
       const cc = tempColor(v);
-      return `<span class="dchip" style="border-color:${cc};box-shadow:0 0 8px ${cc}55">💽 ${k.replace('/dev/','')} <b style="color:${cc}">${v}°C</b></span>`;
+      return `<span class="dchip" style="border-color:${cc};box-shadow:0 0 8px ${cc}55">💽 ${esc(k.replace('/dev/',''))} <b style="color:${cc}">${v}°C</b></span>`;
     }).join('');
     if (window._wTemp != null) {
       const d = (s.truenas.max - window._wTemp).toFixed(1);
@@ -596,7 +597,7 @@ function drawChart(readings, events, series) {
     x.stroke(); x.shadowBlur = 0;
   });
   $('legendDrives').innerHTML = names.map((n, j) =>
-    `<span><span class="chip" style="background:${PALETTE[j % PALETTE.length]}"></span>💽 ${n}</span>`).join(' ');
+    `<span><span class="chip" style="background:${PALETTE[j % PALETTE.length]}"></span>💽 ${esc(n)}</span>`).join(' ');
   const line = (fn, color, width) => { x.strokeStyle = color; x.lineWidth = width; x.shadowColor = color; x.shadowBlur = 9;
     x.beginPath(); pts.forEach((p, i) => i ? x.lineTo(X(i), fn(p)) : x.moveTo(X(0), fn(p))); x.stroke(); x.shadowBlur = 0; x.lineWidth = 1; };
   line(p => Yp(p.pct), '#39ff88', 2);
@@ -860,7 +861,7 @@ function renderForm(parsed) {
       const inp = type === 'select'
         ? `<select data-k="${k}">${['auto','api','ssh'].map(o => `<option ${o===v?'selected':''}>${o}</option>`).join('')}</select>`
         : type === 'check' ? `<input type="checkbox" data-k="${k}" data-t="check" ${v ? 'checked' : ''}>`
-        : `<input data-k="${k}" data-t="${type}" type="${type==='password'?'password':type==='number'?'number':'text'}" value="${v ?? ''}" placeholder="${hint || ''}">`;
+        : `<input data-k="${k}" data-t="${type}" type="${type==='password'?'password':type==='number'?'number':'text'}" value="${esc(v ?? '')}" placeholder="${esc(hint || '')}">`;
       return `<div class="frow"><label>${label}${hint ? `<small>${hint}</small>` : ''}</label>${inp}</div>`;
     }).join('') + `</div>`).join('');
 }

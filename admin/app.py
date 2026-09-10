@@ -36,8 +36,18 @@ except Exception:
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS") or ""  # NO default password — fail fast if unset
 DEBUG = (os.environ.get("ADMIN_DEBUG", "") or os.environ.get("NASTEMP_DEBUG", "")) not in ("", "0", "no", "false")
-_tokens: set[str] = set()
+TOKEN_TTL = 12 * 3600  # bearer tokens expire (limits blast radius if one leaks, e.g. access logs)
+_tokens: dict[str, float] = {}
 _auth = HTTPBearer(auto_error=False)
+
+def _valid_token(tok):
+    ts = _tokens.get(tok or "")
+    if ts is None:
+        return False
+    if time.time() - ts > TOKEN_TTL:
+        _tokens.pop(tok, None)
+        return False
+    return True
 
 def debug(msg):
     if DEBUG:
@@ -75,7 +85,7 @@ def load_cfg():
 
 
 def check_auth(creds: HTTPAuthorizationCredentials = Depends(_auth)):
-    if creds is None or creds.credentials not in _tokens:
+    if creds is None or not _valid_token(creds.credentials):
         raise HTTPException(status_code=401, detail="login required")
     return True
 
@@ -694,7 +704,11 @@ async def login(req: Request):
     if secrets.compare_digest(user, ADMIN_USER) and \
        secrets.compare_digest(str(body.get("pass", "")), ADMIN_PASS):
         tok = secrets.token_hex(16)
-        _tokens.add(tok)
+        _tokens[tok] = time.time()
+        # prune expired so the set can't grow forever
+        for t, ts in list(_tokens.items()):
+            if time.time() - ts > TOKEN_TTL:
+                _tokens.pop(t, None)
         debug(f"login ok user={user!r} tokens={len(_tokens)}")
         return {"token": tok}
     debug(f"login FAIL user={user!r}")
@@ -746,7 +760,7 @@ def fast(_: bool = Depends(check_auth)):
 @app.get("/stream")
 async def stream(token: str = ""):
     """Realtime push over SSE (plain HTTP, auto-reconnect): status JSON every 2s."""
-    if token not in _tokens:
+    if not _valid_token(token):
         raise HTTPException(status_code=403, detail="login required")
     async def gen():
         while True:
