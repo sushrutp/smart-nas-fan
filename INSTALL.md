@@ -103,6 +103,28 @@ ADMIN_USER=me ADMIN_PASS='s3cret!' docker compose up -d --build admin
   `docker compose restart controller` (native: `systemctl restart nastemp-controller`).
 - The `admin` container needs no `privileged` (sysfs mounted `:ro` for the fan readout).
 
+## 4c. Run the GUI on a different VM/host (remote mode)
+
+The controller **must** stay on Proxmox (it touches `/sys`). The GUI can live anywhere
+with IP access — it reads Proxmox files over **SSH key auth** instead of local mounts:
+
+```bash
+# on the other VM/host:
+ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_proxmox   # if you don't have a key yet
+ssh-copy-id -i ~/.ssh/id_proxmox root@192.168.1.2  # trust it on Proxmox
+# docker: uncomment the PROXMOX_* env + ~/.ssh mount in compose, then:
+PROXMOX_HOST=192.168.1.2 PROXMOX_USER=root docker compose up -d --build admin
+# native (no docker): apt install python3-fastapi python3-uvicorn + pip install paramiko, then:
+PROXMOX_HOST=192.168.1.2 PROXMOX_USER=root PROXMOX_CONFIG=/opt/nastemp/config.yaml \
+  python3 -m uvicorn app:app --host 0.0.0.0 --port 6767 --app-dir ./admin
+# open: http://<this-vm-ip>:6767  (header shows 📍 remote → 192.168.1.2)
+```
+
+In remote mode fan PWM, heartbeat, DB/graphs/CSV, logs, config editor, manual slider
+and Proxmox CPU/RAM all go over SSH (`PROXMOX_CONFIG` = controller config **on Proxmox**).
+TrueNAS/MQTT/ntfy/weather are network services and work identically. Empty
+`PROXMOX_HOST` = local mode (current behavior, zero change).
+
 ## 5. Install — Home Assistant (graphs where spike = fan rise)
 
 1. Paste `ha_sensors.yaml` into HA `configuration.yaml` (or package), reload MQTT / restart. New: `sensor.nas_temp_source` (api/ssh), `sensor.nas_hdd_count`.

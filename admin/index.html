@@ -137,6 +137,7 @@ canvas{width:100%;height:260px;background:#060918f2;border:1px solid var(--line)
   <span id="clock">--:--:--.---</span>
   <span id="ver" class="dim mono"></span>
   <span id="modeBadge" class="modebadge">● LIVE</span>
+  <span id="whereBadge" class="modebadge" title="where this GUI reads Proxmox files from">📍 local</span>
   <span class="sp"></span>
   <div class="seg"><button id="mLive" class="on">● live</button><button id="mDemo">▶ demo</button></div>
   <button id="cfgBtn">⚙️ config</button>
@@ -436,6 +437,11 @@ function setFan(pct, state, pwm, rpm) {
 function render(s) {
   window._lastPct = s.fan.pct;
   if (s.version && !$('ver').textContent) $('ver').textContent = 'v' + s.version;
+  const wb = $('whereBadge');
+  if (s.where && s.where.mode === 'remote') {
+    wb.textContent = '📍 remote → ' + (s.where.proxmox || '?');
+    wb.classList.add('demo');
+  } else { wb.textContent = '📍 local'; wb.classList.remove('demo'); }
   $('e_tru_lbl').textContent = s.truenas.ok ? (s.truenas.max + '°C') : '✖';
   $('e_tru_ms').textContent = s.truenas.ok && s.truenas.latency_ms != null ? `⚡${s.truenas.latency_ms}ms` : '';
   $('e_mqtt_ms').textContent = s.mqtt.ok && s.mqtt.latency_ms != null ? `⚡${s.mqtt.latency_ms}ms` : '';
