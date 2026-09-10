@@ -75,6 +75,7 @@ services:
       # Copy the admin service to your other host, then set:
       # PROXMOX_HOST: 192.168.1.2      # Proxmox IP — empty = local mode
       # PROXMOX_USER: root
+      # PROXMOX_PORT: 22               # custom SSH port if yours differs
       # PROXMOX_KEY: /root/.ssh/id_ed25519
       # PROXMOX_CONFIG: /opt/nastemp/config.yaml   # controller config ON proxmox
       TZ: ${TZ:-UTC}
