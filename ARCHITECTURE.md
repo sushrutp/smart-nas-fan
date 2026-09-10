@@ -7,25 +7,28 @@ Smart HDD-temperature fan control: **Proxmox** drives chassis fans from **TrueNA
 ```text
                     +------------------+
                     | TrueNAS (VM/host)|
-                    | smartctl per-disk|
-                    | °C  192.168.1.10 |
+                    | HDD-only °C:     |
+                    | API 443 (first)  |
+                    | SSH 22 (fallback)|
                     +--------+---------+
-                             | SSH port 22 (paramiko, key auth)
-                             | commands: ls /dev/sd? ; smartctl -A -j /dev/sdX
+                             | poll: disk.query+temperatures / smartctl
                              v
 +-------------+    +----------------------+    +-------------------+
 | /sys/class/ |<-->| PROXMOX HOST         |--->| Home Assistant    |
 | hwmon it87  |    | fan_controller.py    |--->| Mosquitto broker  |
 | pwm2 +      |    |  - control law       | MQTT 1883 | HA sensors  |
-| pwm2_enable |    |  - stepping          |    +-------------------+
+| pwm2_enable |    |  - stepping+manual   |    +-------------------+
 | fan2_input  |    |  - heartbeat         |
 +-------------+    +----------+-----------+    +-------------------+
      ^                        | ntfy HTTP POST    | Phone / browser |
      |              +---------v-----------+    | ntfy server+topic |
-     |              | watchdog.py         |--->| e.g. http://       |
-     +--------------| forces PWM 102 if   |    | 192.168.1.5:8080/ |
-                    | heartbeat stale     |    | nastemp           |
-                    +---------------------+    +-------------------+
+     +--------------| watchdog.py         |--->| (failures, critical,|
+                    | forces PWM 102 if   |    |  recovery)          |
+                    | heartbeat stale     |    +-------------------+
+                    +----------+----------+
+                               |
+                    admin UI :6767 (local files, or any VM via SSH)
+                    flow map · RGB fan · graphs · CSV · config editor · slider
 ```
 
 Two runtimes, same code:
@@ -41,14 +44,15 @@ Both modes do the same logic. Only packaging differs (see §7).
 
 | System | Role | Runs what | Needs |
 |---|---|---|---|
-| **Proxmox host** (`it87` / `pwm2`) | Actuator + compute. Owns fans. | `fan_controller.py` + `watchdog.py` (native or Docker). Arctic P12 Pro daisy-chain. | `it87` kernel module, Python deps, `config.yaml`, SSH key to TrueNAS |
-| **TrueNAS** | Sensor. Owns HDD temps. No agent installed. | Stock `smartctl` only, queried remotely over SSH | SSH enabled, user with `smartctl` rights, key auth |
+| **Proxmox host** (`it87` / `pwm2`) | Actuator + compute. Owns fans. | `fan_controller.py` + `watchdog.py` (+ admin UI, native or Docker). Arctic P12 Pro daisy-chain. | `it87` kernel module, venv deps (`setup.sh`), `config.yaml` + secrets in `.env` / `nastemp.env`, SSH key to TrueNAS |
+| **TrueNAS** | Sensor. Owns HDD temps. No agent installed. | HTTPS API (`disk.query` + `disk.temperatures`, HDD-only), SSH `smartctl` fallback | API key (`REPORTING_READ`) and/or SSH user with `smartctl` rights + key auth |
 | **MQTT broker (Mosquitto, usually on/with HA)** | Telemetry bus. Live values + history source. | Mosquitto broker | IP/port/user/pass, `nastemp/#` topics |
 | **Home Assistant** | Visualization + history DB. Read-only subscriber. | `ha_sensors.yaml` sensors + `ha_dashboard.yaml` cards + `recorder` | MQTT integration pointed at broker |
-| **ntfy server** | Push alerts. Fire-and-forget HTTP. | Any ntfy server (self-hosted or ntfy.sh) + topic | URL + topic name |
-| **Logs on Proxmox/container** | Independent text + JSON history DB (works even if HA/MQTT down) | `/var/log/nastemp.log` + `/var/log/nastemp.jsonl` (Docker: `./logs/`) | Disk space only |
+| **ntfy server** | Push alerts (failures, critical, recovery). Fire-and-forget HTTP. | Any ntfy server (self-hosted or ntfy.sh) + topic | URL + topic name (bearer secret → `.env`) |
+| **Admin UI** (`:6767`, Proxmox or any VM) | Monitor + control (slider, config editor, graphs, CSV). Never drives fans directly. | `admin/app.py` + `index.html` (FastAPI) | `ADMIN_PASS`, file access (local mounts or `PROXMOX_HOST` SSH) |
+| **Logs on Proxmox/container** | Independent text + JSON + SQLite history (works even if HA/MQTT down) | `/var/log/nastemp.log` + `.jsonl` + `.db` (Docker: `./logs/`) | Disk space only |
 
-No cloud, no extra API server, no database container.
+No cloud, no extra database container. The only inbound port in the project is the admin UI's `:6767` (LAN-only).
 
 ## 3. Communication between systems (how + protocol + direction)
 
@@ -103,8 +107,9 @@ No cloud, no extra API server, no database container.
 | `fan/pct` | `pwm/2.55` % | false | `sensor.nas_fan_speed` |
 | `fan/rpm` | `fan2_input` or omitted | false | `sensor.nas_fan_rpm` |
 | `fan/target` | computed target PWM | false | `sensor.nas_fan_target` |
+| `fan/mode` | `auto`/`manual` (slider override active?) | false | `sensor.nas_fan_mode` |
 | `status` | human line: `step_up max=43.2C avg=... pwm=150(58.8%) rpm=... why:...` | false | `sensor.nas_fan_status` |
-| `event` | JSON `{ts,event:step_up\|step_down\|emergency\|failsafe_step_down\|maxboost_stepdown, max_temp, pwm, why}` | false | `sensor.nas_fan_event` (Logbook) |
+| `event` | JSON `{ts,event:step_up\|step_down\|emergency\|failsafe_step_down\|maxboost_stepdown\|manual_set\|manual_expired, max_temp, pwm, why}` | false | `sensor.nas_fan_event` (Logbook) |
 | `online` | `online`/`offline` (LWT) | true | `sensor.nas_controller_online` |
 
 * **HA side:** `ha_sensors.yaml` defines MQTT sensors; `ha_dashboard.yaml` gives Entities (Now) + history-graph (Temp vs Fan) + Logbook (Why?) + Markdown legend. Long-term history = HA `recorder` (`purge_keep_days: 30` suggested). Verify with `mosquitto_sub -h BROKER -t "nastemp/#" -v`.
@@ -125,15 +130,19 @@ No cloud, no extra API server, no database container.
 
 ## 4. Tokens / credentials / APIs needed
 
-You need 3 credentials + 1 optional topic secret:
+Secrets live in **`.env`** (Docker, gitignored) or **`/opt/nastemp/nastemp.env`** (native,
+0600) — never in files. `config.yaml` holds `${VAR}` / `${VAR:-default}` placeholders
+expanded at load. You need:
 
 | # | What | Where to create/get it | Where to put it | Code that uses it |
 |---|---|---|---|---|
-| 1 | **TrueNAS API key (HDD-only temps, preferred)** — Bearer token | TrueNAS UI: Credentials → API Keys → Add (needs `REPORTING_READ` or admin). Name e.g. `nastemp-monitor`. Copy once → password manager. Must use `https://` (TrueNAS **revokes** keys sent over plain HTTP). Test: `curl -k -H "Authorization: Bearer <KEY>" https://TRUENAS/api/v2.0/system/info`. Uses `disk.query` (type/rotationrate filter → HDD only) + `disk.temperatures` (cached ≤5 min by TrueNAS). | `config.yaml: truenas.api_url` (e.g. `https://192.168.1.10`), `truenas.api_key`, `truenas.verify_ssl:false` (self-signed) or `TRUENAS_API_KEY` env (Docker-safe, preferred). `truenas.method: auto/api/ssh`, `hdd_only:true`. | `fan_controller.py:api_post()/api_hdd_names()/get_temps_via_api()` |
-| 1b | **TrueNAS SSH keypair (fallback)** — used when `method:auto/ssh` or API down | On Proxmox: `ssh-keygen -t ed25519 -N ""`, then `ssh-copy-id admin@TRUENAS_IP`. Verify: `ssh admin@TRUENAS_IP "smartctl -A /dev/sda \| head -20"`. SSDs excluded via `lsblk ROTA` + `nvme` skip. | `config.yaml: truenas.host`, `truenas.user`, `truenas.key_path`. Docker: host `~/.ssh` → `/root/.ssh:ro`. | `fan_controller.py:ssh_exec()/discover_drives()` |
-| 2 | **MQTT broker user/pass** (if broker requires auth; else leave empty) | Mosquitto / HA add-on: note broker IP, port, username, password. HA side: Settings → Devices → MQTT → configure same broker. | `config.yaml: mqtt.broker`, `mqtt.port`, `mqtt.username`, `mqtt.password`, `mqtt.base`. | `fan_controller.py:Pub.__init__()` |
-| 3 | **ntfy topic URL** (acts as bearer secret — anyone with URL can publish/read) | Self-hosted: `http://192.168.1.5:8080/nastemp`. Public: `https://ntfy.sh/YOUR-UNGUESSABLE-TOPIC-HERE` (pick unguessable suffix). No signup. Test: `curl -d "test" <URL>`. Sent on: 1st API fail (`on_api_fail`), failsafe (`on_failsafe`), step_up, critical. | `config.yaml: ntfy.url`, `ntfy.enabled`, `on_step_up/on_step_down/on_failsafe/on_critical/on_api_fail`. Watchdog (Docker): optional `NASTEMP_NTFY` env. | `fan_controller.py:ntfy()`, `watchdog.py` urllib block |
+| 1 | **TrueNAS API key (HDD-only temps, preferred)** — Bearer token | TrueNAS UI: Credentials → API Keys → Add (needs `REPORTING_READ` or admin). Name e.g. `nastemp-monitor`. Copy once → password manager. Must use `https://` (TrueNAS **revokes** keys sent over plain HTTP). Test: `curl -k -H "Authorization: Bearer <KEY>" https://TRUENAS/api/v2.0/system/info`. Uses `disk.query` (type/rotationrate filter → HDD only) + `disk.temperatures` (cached ≤5 min by TrueNAS). | `.env: TRUENAS_API_KEY` (+ `TRUENAS_HOST`, `TRUENAS_API_URL`). Native: same names in `nastemp.env`. | `fan_controller.py:api_post()/api_hdd_names()/get_temps_via_api()` |
+| 1b | **TrueNAS SSH keypair (fallback)** — used when `method:auto/ssh` or API down | On Proxmox: `ssh-keygen -t ed25519 -N ""`, then `ssh-copy-id admin@TRUENAS_IP`. Verify: `ssh admin@TRUENAS_IP "smartctl -A /dev/sda \| head -20"`. SSDs excluded via `lsblk ROTA` + `nvme` skip. Key files stay on disk (0600), referenced by path only. | `config.yaml: truenas.key_path` (+ `TRUENAS_USER` env for the login name). Docker: host `~/.ssh` → `/root/.ssh:ro`. | `fan_controller.py:ssh_exec()/discover_drives()` |
+| 2 | **MQTT broker user/pass** (if broker requires auth; else leave empty) | Mosquitto / HA add-on: note broker IP, port, username, password. HA side: Settings → Devices → MQTT → configure same broker. | `.env: MQTT_BROKER / MQTT_USER / MQTT_PASSWORD`. | `fan_controller.py:Pub.__init__()` |
+| 3 | **ntfy topic URL** (acts as bearer secret — anyone with URL can publish/read) | Self-hosted: `http://192.168.1.5:8080/nastemp`. Public: `https://ntfy.sh/YOUR-UNGUESSABLE-TOPIC-HERE` (pick unguessable suffix). No signup. Test: `curl -d "test" <URL>`. Sent on: 1st API fail (`on_api_fail`), failsafe (`on_failsafe`), step_up, critical, MQTT/PWM failures, recoveries (`on_recovery`). | `.env: NTFY_URL`. Watchdog: same var (or `NASTEMP_NTFY`). | `fan_controller.py:ntfy()`, `watchdog.py` urllib block |
+| 4 | **Admin login** — no defaults, fail-fast | You invent it (`setup.sh` generates + prints one if unset). | `.env: ADMIN_USER / ADMIN_PASS` (compose refuses to start the admin service without it). | `admin/app.py:login()` → 12h bearer token |
 | — | HA `recorder` retention (optional, no token) | `configuration.yaml`: `recorder: purge_keep_days: 30` + include list from README | HA config only | — |
+| — | Outside weather | None — Open-Meteo, free, no key. Just `weather.postcode/country` in config. | `config.yaml` (non-secret) | `admin/app.py:outside_weather()` |
 
 No Proxmox API token (local sysfs only), no Docker Hub token, no HA long-lived token (MQTT sensors only). Fan control always runs on Proxmox (native or Docker on the Proxmox host with `/sys` passthrough).
 
@@ -147,14 +156,18 @@ No Proxmox API token (local sysfs only), no Docker Hub token, no HA long-lived t
 | Proxmox → ntfy server | TCP 80/443/8080 / HTTP POST | push alerts | yes if `ntfy.enabled:true` |
 | HA → MQTT broker | TCP 1883 | subscribe `nastemp/#` | yes (usually localhost/same LAN if broker is HA add-on) |
 | Admin laptop → Proxmox | SSH / Docker / `mosquitto_sub` | setup + `mosquitto_sub -h BROKER -t "nastemp/#" -v` debug | ops only |
-| Proxmox → Internet (PyPI) | HTTPS | `pip install -r requirements.txt` / `docker build` (paho-mqtt, paramiko, pyyaml, requests) | build-time only |
+| You → admin UI host | TCP **6767** / HTTP + login | neon control center (local or remote mode) | yes, LAN-only |
+| Proxmox → Internet (PyPI) | HTTPS | venv build (`pip install`, see `requirements.txt` + fastapi/uvicorn/paramiko) / `docker build` | build-time only |
 
-No inbound ports opened on Proxmox by this project. All flows are outbound polls/publishes + local `/sys` writes.
+The only inbound port in the project is the admin UI's `:6767` (login-required, LAN-only).
+Everything else is outbound polls/publishes + local `/sys` writes.
 
 ## 6. Config surface (single file + env overrides)
 
-* **`config.yaml`** — all tuning, no code edits. Sections: `truenas:` (method/api_url/api_key/verify_ssl/hdd_only/host/user/key/drives/fail_threshold), `fan:` (channel/driver/floor/ceiling/emergency/safe), `temps_c:` (cool/warm/hot/critical/hysteresis), `timing:` (interval/step_up/step_down/cooldown/max_boost/heartbeat/log/jsonl/db paths), `mqtt:`, `ntfy:` (+`on_api_fail`). Defaults: floor `102 (40%)`, ceiling `184 (72%)`, `cool 36 / hot 45 / critical 52 / hysteresis 1.5`, `interval 30s, +12/-6, cooldown 300s, max_boost 1200s`, `method:auto, hdd_only:true`.
-* **Env overrides:** `NASTEMP_CONFIG`, `TRUENAS_API_KEY` (preferred over config file for the TrueNAS key), `NASTEMP_HEARTBEAT`, `NASTEMP_SAFE_PWM` (default 102), `NASTEMP_STALE_SEC` (default 300), `NASTEMP_PWM` (default `pwm2`), `NASTEMP_NTFY` (watchdog only), `TZ`, `SAFE_PWM/STALE_SEC/PWM_CHANNEL` (compose → watchdog env).
+* **`config.yaml`** — all tuning, no code edits. Secrets are `${VAR}` placeholders
+  expanded from `.env` / `nastemp.env` at load (`$VAR`, `${VAR}`, `${VAR:-default}`;
+  unset → `""`). Sections: `debug:`, `truenas:` (method/api_url/api_key/verify_ssl/hdd_only/host/user/key/drives/fail_threshold), `fan:`, `temps_c:`, `timing:` (interval/step_up/step_down/cooldown/max_boost/heartbeat/override/log/jsonl/db paths), `manual:` (enabled/max_sec/min_pwm), `mqtt:`, `ntfy:` (+`on_api_fail`, `on_recovery`), `weather:` (postcode/country). Defaults: floor `102 (40%)`, ceiling `184 (72%)`, `cool 36 / hot 45 / critical 52 / hysteresis 1.5`, `interval 30s, +12/-6, cooldown 300s, max_boost 1200s`, `method:auto, hdd_only:true`.
+* **Env (secrets + overrides):** `TRUENAS_API_KEY` (+`TRUENAS_HOST/API_URL/USER`), `MQTT_BROKER/USER/PASSWORD`, `NTFY_URL`, `ADMIN_USER` (+required `ADMIN_PASS`), `PROXMOX_HOST/USER/PORT/KEY/CONFIG` (remote GUI), `NASTEMP_CONFIG`, `NASTEMP_HEARTBEAT`, `NASTEMP_SAFE_PWM` (default 102), `NASTEMP_STALE_SEC` (default 300), `NASTEMP_PWM` (default `pwm2`), `NASTEMP_DEBUG`/`ADMIN_DEBUG`, `TZ`, `SAFE_PWM/STALE_SEC/PWM_CHANNEL` (compose → watchdog env).
 * **HA:** paste `ha_sensors.yaml` into `configuration.yaml` (MQTT sensors incl. `hdd/source`, `hdd/count`), merge `ha_dashboard.yaml` via Dashboard Raw config. The key card is **"Temp spike -> Fan rise (SAME axis)"** — max/avg temp + fan % + target on one history-graph so a temp spike and the fan increase share timestamps. Optional `recorder:` + critical-temp automation (README §6.4).
 * **SQLite history DB** (`timing.db_file`, default `/var/log/nastemp.db`, Docker `./logs/`): tables `readings(ts,source,max_temp,avg_temp,target,pwm,pct,rpm,action,why)`, `drive_temps(ts,drive,temp)`, `events(ts,event,max_temp,pwm,why)`. Query: `sqlite3 /var/log/nastemp.db "SELECT ts,max_temp,pwm,action FROM readings ORDER BY ts DESC LIMIT 20;"`. Complements `.jsonl` (machine) + `.log` (human) + HA recorder.
 
@@ -173,7 +186,13 @@ No inbound ports opened on Proxmox by this project. All flows are outbound polls
   * `controller` (`nastemp-controller`): `command: ["python","fan_controller.py"]`, `privileged:true`, `restart: unless-stopped`, `NASTEMP_CONFIG=/config/config.yaml`. Mounts: `./config.yaml:/config/config.yaml:ro`, `~/.ssh:/root/.ssh:ro` (TrueNAS key), `./logs:/var/log` (persisted logs), `heartbeat:/run/nastemp` (shared), `/sys/class/hwmon:/sys/class/hwmon:rw` (hardware).
   * `watchdog` (`nastemp-watchdog`): `command: ["python","watchdog.py"]`, same `privileged` + sysfs bind + `heartbeat` volume + `./logs`. Env: `NASTEMP_HEARTBEAT/SAFE_PWM/STALE_SEC/PWM` (overridable via `SAFE_PWM/STALE_SEC/PWM_CHANNEL/TZ` without editing compose).
 * **Lifecycle:** `docker compose up -d --build` → `logs -f controller|watchdog`. Config change → `docker compose up -d --build`. Stop: park fans first — `echo 102 > $(grep -l it87 ...)` — then `docker compose down` (fans **stay** at last PWM on stop, they don't auto-reset).
-* **Native equivalent** (`setup.sh` on Proxmox as root): `apt install python3-pip smartmontools`, pip install reqs, copy `.py` to `/opt/nastemp/`, create `/run/nastemp`, touch log files, write two systemd units (`Restart=always`, `RestartSec=10`), `daemon-reload + enable`. Then edit `/opt/nastemp/config.yaml`, `systemctl start nastemp-controller nastemp-watchdog`.
+* **Native equivalent** (`setup.sh` on Proxmox as root): builds isolated venv
+  (`/opt/nastemp-venv`, all Python deps), copies `.py` + admin files to
+  `/opt/nastemp[/-admin]/`, writes `nastemp.env` (0600, secrets + generated
+  `ADMIN_PASS`), creates `/run/nastemp`, touches log files, writes **three**
+  systemd units (`Restart=always`, `RestartSec=10`), `daemon-reload + enable`.
+  Idempotent — safe to re-run after Proxmox updates; never overwrites your live
+  config. Then `systemctl start nastemp-controller nastemp-watchdog nastemp-admin`.
 * **Admin center** (`admin/`, 3rd service): FastAPI on `0.0.0.0:6767` (no privileged, sysfs `:ro`, heartbeat volume `:rw` for the override file). Neon UI: flow map, animated 🌀, shared-axis chart, logs, config editor (saves `config.yaml`, keeps `.bak`). Auth: `ADMIN_USER`/`ADMIN_PASS` env (login form → bearer token). Only inbound port of the whole project — keep LAN-only.
 * **Manual override** (`/run/nastemp/override.json`, admin slider): clamped to `manual.min_pwm..255`, auto-expires after `manual.max_sec` (default 30 min), ignored on the no-temps failsafe path, critical temps always win, `EVENT manual_set/manual_expired` in log+DB+ntfy, `fan/mode` auto|manual topic. Chunked sleep re-checks the file every ≤5s so the slider feels live.
 

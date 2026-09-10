@@ -10,6 +10,7 @@
 | 4 | Graphs + history | **Home Assistant** | Paste `ha_sensors.yaml`, merge `ha_dashboard.yaml`. |
 | 5 | Push alerts | **ntfy server** (self-hosted or ntfy.sh) + your phone/browser | Pick a topic URL (see §1). |
 | 6 | History DB (local, no network) | **Proxmox** `/var/log/` (Docker: `./logs/`) | `nastemp.log` + `nastemp.jsonl` + `nastemp.db` — automatic. |
+| 7 | Admin control center 🌀 | **Proxmox** (same host) **or any VM** (remote SSH mode) | `docker compose up -d admin` or `setup.sh` (adds `nastemp-admin` service). `:6767`, login required. See §4b/§4c. |
 
 Fan control NEVER leaves Proxmox. Everything else is poll (outbound) or publish (outbound).
 
@@ -26,7 +27,7 @@ Fan control NEVER leaves Proxmox. Everything else is poll (outbound) or publish 
 
 No Proxmox token, no Docker token, no HA token needed.
 
-## 2. Firewall rules you need (all OUTBOUND from Proxmox, nothing inbound)
+## 2. Firewall rules you need (outbound from Proxmox + one LAN-only inbound)
 
 | From → To | Port | Why | Allow? |
 |---|---|---|---|
@@ -43,11 +44,12 @@ Rule of thumb: allow Proxmox out to TrueNAS + broker + ntfy. Only inbound port i
 
 ```bash
 cd nastemp-2
-nano config.yaml   # fill §1 items: api_url, api_key, truenas.host, mqtt.broker, ntfy.url
-sudo bash setup.sh
-nano /opt/nastemp/config.yaml   # repeat your edits (installed copy)
-sudo systemctl start nastemp-controller nastemp-watchdog
-systemctl status nastemp-controller nastemp-watchdog
+TRUENAS_API_KEY="..." NTFY_URL="..." ADMIN_PASS="..." sudo -E bash setup.sh
+# (omit any var: setup.sh generates ADMIN_PASS and prints it once)
+nano /opt/nastemp/config.yaml   # installed copy — non-secret tuning (secrets live in /opt/nastemp/nastemp.env)
+sudo systemctl start nastemp-controller nastemp-watchdog nastemp-admin
+systemctl status nastemp-controller nastemp-watchdog nastemp-admin
+# UI: http://<proxmox-ip>:6767
 ```
 
 ### 3b. Surviving Proxmox updates (no Docker needed, nothing to redo by hand)
@@ -62,7 +64,7 @@ systemctl status nastemp-controller nastemp-watchdog
   sudo systemctl restart nastemp-controller nastemp-watchdog nastemp-admin
   modprobe it87   # only if `grep -H . /sys/class/hwmon/hwmon*/name` lost it87 after a kernel update
   ```
-- **Keep a repo clone on Proxmox** (`git clone -b v1.5 git@github.com:sushrutp/smart-nas-fan.git ~/smart-nas-fan`)
+- **Keep a repo clone on Proxmox** (`git clone git@github.com:sushrutp/smart-nas-fan.git ~/smart-nas-fan`)
   so recovery never depends on re-uploading files.
 - **Back up two files** (everything else is regenerable): `/opt/nastemp/config.yaml`
   (your keys/settings) and `/var/log/nastemp.db` (history).
@@ -121,7 +123,7 @@ docker compose up -d --build admin
 # open: http://<docker-host-ip>:6767  (login with ADMIN_USER / ADMIN_PASS from .env)
 ```
 
-- Login with those credentials (defaults `admin` / `nastemp` — change them!).
+- Login with those credentials (from `.env` — there are no defaults; compose fails fast without `ADMIN_PASS`).
 - Fan control stays in `controller`; after saving config in the UI, restart it:
   `docker compose restart controller` (native: `systemctl restart nastemp-controller`).
 - The `admin` container needs no `privileged` (sysfs mounted `:ro` for the fan readout).
@@ -195,8 +197,8 @@ sqlite3 /var/log/nastemp.db "SELECT ts,event,max_temp,pwm FROM events ORDER BY t
 # 7. ntfy (phone/web) — you get a push for EVERY failure + recovery:
 # restart controller -> "nastemp started". Break TrueNAS key -> "TrueNAS failed ... DOWN since <ts>".
 # Stop Mosquitto -> "MQTT failed ... HA graphs blind". Unplug pwm (it87 rmmod) -> urgent "FAN CONTROL failure".
-# Fix it -> "recovered after Ns" pushes. Watchdog force-reset -> push ONLY if NASTEMP_NTFY is set
-#   (native: uncomment Environment=NASTEMP_NTFY in nastemp-watchdog.service; docker: uncomment in compose).
+# Fix it -> "recovered after Ns" pushes. Watchdog force-reset -> push if NTFY_URL is set
+#   (native: /opt/nastemp/nastemp.env; docker: .env + NASTEMP_NTFY passthrough).
 
 # 8. HA:
 # Developer Tools -> States: sensor.nas_hdd_max_temp, sensor.nas_fan_speed have values.
@@ -208,7 +210,7 @@ sqlite3 /var/log/nastemp.db "SELECT ts,event,max_temp,pwm FROM events ORDER BY t
 # admin:      ADMIN_DEBUG=1 (env) + restart -> docker compose logs -f admin
 # Secrets print masked (***len); URLs visible. Logs stay local.
 
-# 9. Admin UI down-timers (http://<host>:6767):
+# 10. Admin UI down-timers (http://<host>:6767):
 # break any link -> its pill turns 🔴 and a "🔴 <link> down HH:MM:SS.mmm" timer ticks under the flow map.
 # Fix it -> timer clears, "🟢 all links up". Same works in ▶ demo mode (random faults).
 ```

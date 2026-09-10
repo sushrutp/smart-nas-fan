@@ -55,8 +55,8 @@ services:
       NASTEMP_SAFE_PWM: ${SAFE_PWM:-102}
       NASTEMP_STALE_SEC: ${STALE_SEC:-300}
       NASTEMP_PWM: ${PWM_CHANNEL:-pwm2}
-      # Optional: set NASTEMP_NTFY to your ntfy URL for watchdog alerts
-      # NASTEMP_NTFY: http://192.168.1.5:8080/nastemp
+      NTFY_URL: ${NTFY_URL:-}
+      # Watchdog pushes via NTFY_URL (falls back to NASTEMP_NTFY if you set that instead).
       TZ: ${TZ:-UTC}
     volumes:
       - ./logs:/var/log

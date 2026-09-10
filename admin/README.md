@@ -31,8 +31,9 @@ writes the self-expiring `override.json` for manual control.
 
 ```bash
 cd nastemp-2
-ADMIN_USER=me ADMIN_PASS='s3cret!' docker compose up -d --build admin
-# → http://<proxmox-ip>:6767
+cp .env.example .env && nano .env   # ADMIN_PASS required — compose fails fast without it
+docker compose up -d --build admin
+# → http://<proxmox-ip>:6767  (login with ADMIN_USER / ADMIN_PASS from .env)
 ```
 
 ### B. Native on Proxmox, no Docker (local mode)
@@ -81,6 +82,7 @@ holds `${VAR}` / `${VAR:-default}` placeholders, expanded at load.
 | `PROXMOX_KEY` | `/root/.ssh/id_ed25519` | remote mode | Key file (mount `~/.ssh:/root/.ssh:ro` in Docker) |
 | `PROXMOX_CONFIG` | `/opt/nastemp/config.yaml` | remote mode | Controller config **on Proxmox** (what the editor edits) |
 | `TZ` | `UTC` | cosmetic | Timestamps in logs/UI |
+| `ADMIN_DEBUG` (or `NASTEMP_DEBUG`) | off | debugging | Verbose probe trace, secrets masked (see below) |
 
 Controller-side knobs the UI respects (in `config.yaml`, editable in the UI form):
 `truenas.*` (API/SSH, HDD-only), `fan.*`, `temps_c.*`, `timing.*`, `mqtt.*`,
@@ -115,9 +117,9 @@ at 97ms on any transport.
 
 | Symptom | Fix |
 |---|---|
-| `📍 remote` but fan shows `proxmox ssh: …` | Key not trusted: `ssh-copy-id`, check `PROXMOX_USER/PORT/KEY`, port 22 reachable |
+| `📍 remote` but fan shows `proxmox ssh: …` | Key not trusted: `ssh-copy-id`, check `PROXMOX_USER/PORT/KEY`, SSH port reachable |
 | `No module named 'paramiko'` | Native remote needs it: `pip install paramiko` (Docker image already has it) |
-| Login loops / 401s | `ADMIN_USER/PASS` differ between UI and server; token is per server start |
+| Login loops / 401s | Wrong password, or token expired (12h TTL — just log in again) |
 | Edits don't affect fans | Editor saves the file — restart the **controller** (`docker compose restart controller`) |
 | Port in use | Another admin running: `ps aux \| grep uvicorn` / `docker ps` |
 
