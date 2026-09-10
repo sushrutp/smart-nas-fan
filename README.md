@@ -17,7 +17,7 @@ stuck at high speed.
   never 100% in normal regulation. **255 only on critical (≥52 °C).**
 
 Docs: `INSTALL.md` (setup, step-by-step) · `ARCHITECTURE.md` (how it all works) ·
-`admin/README.md` (control center) · `VERSION` (current release).
+`admin/README.md` (control center) · `VERSION` (current release) · `CHANGELOG.md` (history).
 
 ---
 
