@@ -60,6 +60,7 @@ def check_auth(creds: HTTPAuthorizationCredentials = Depends(_auth)):
 def prox_cfg():
     return {"host": os.environ.get("PROXMOX_HOST", ""),
             "user": os.environ.get("PROXMOX_USER", "root"),
+            "port": int(os.environ.get("PROXMOX_PORT", "22")),
             "key": os.environ.get("PROXMOX_KEY", "/root/.ssh/id_ed25519"),
             "config": os.environ.get("PROXMOX_CONFIG", "/opt/nastemp/config.yaml")}
 
@@ -82,7 +83,7 @@ def _ssh_client():
     p = prox_cfg()
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    c.connect(hostname=p["host"], username=p["user"],
+    c.connect(hostname=p["host"], port=p["port"], username=p["user"],
               key_filename=os.path.expanduser(p["key"]),
               timeout=8, banner_timeout=8, auth_timeout=8)
     return c
@@ -99,7 +100,7 @@ def ssh_client():
     """Persistent SSH connection (reconnects on failure). One handshake, then ~RTT per command."""
     global _ssh_pooled, _ssh_pkey
     p = prox_cfg()
-    key = (p["host"], p["user"], p["key"])
+    key = (p["host"], p["port"], p["user"], p["key"])
     with _ssh_lock:
         if _ssh_pooled is None or _ssh_pkey != key:
             try:

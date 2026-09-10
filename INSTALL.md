@@ -139,6 +139,7 @@ PROXMOX_HOST=192.168.1.2 PROXMOX_USER=root docker compose up -d --build admin
 PROXMOX_HOST=192.168.1.2 PROXMOX_USER=root PROXMOX_CONFIG=/opt/nastemp/config.yaml \
   python3 -m uvicorn app:app --host 0.0.0.0 --port 6767 --app-dir ./admin
 # open: http://<this-vm-ip>:6767  (header shows 📍 remote → 192.168.1.2)
+# custom SSH port: PROXMOX_PORT=2222. Key: PROXMOX_KEY=/root/.ssh/id_ed25519 (default).
 ```
 
 In remote mode fan PWM, heartbeat, DB/graphs/CSV, logs, config editor, manual slider
