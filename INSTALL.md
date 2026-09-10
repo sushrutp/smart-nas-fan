@@ -125,6 +125,13 @@ and Proxmox CPU/RAM all go over SSH (`PROXMOX_CONFIG` = controller config **on P
 TrueNAS/MQTT/ntfy/weather are network services and work identically. Empty
 `PROXMOX_HOST` = local mode (current behavior, zero change).
 
+**Freshness in remote mode (honest numbers):** SSH holds one persistent connection
+(auto-reconnect); the fan gauge has a **1s fast lane** (`/api/fast` = fan+heartbeat in
+a single roundtrip, ~RTT). Full status pushes every ~2s, history DB re-pulls every 30s
+(data only changes every 30s anyway), TrueNAS temps refresh every ~5 min **by TrueNAS
+design**. The ms clock, boosted-since and down-since timers always tick client-side
+at 97ms regardless of transport.
+
 ## 5. Install — Home Assistant (graphs where spike = fan rise)
 
 1. Paste `ha_sensors.yaml` into HA `configuration.yaml` (or package), reload MQTT / restart. New: `sensor.nas_temp_source` (api/ssh), `sensor.nas_hdd_count`.

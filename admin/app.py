@@ -88,13 +88,42 @@ def _ssh_client():
     return c
 
 
+import threading as _th
+
+_ssh_lock = _th.Lock()
+_ssh_pooled = None
+_ssh_pkey = None
+
+
+def ssh_client():
+    """Persistent SSH connection (reconnects on failure). One handshake, then ~RTT per command."""
+    global _ssh_pooled, _ssh_pkey
+    p = prox_cfg()
+    key = (p["host"], p["user"], p["key"])
+    with _ssh_lock:
+        if _ssh_pooled is None or _ssh_pkey != key:
+            try:
+                _ssh_pooled.close()
+            except Exception:
+                pass
+            _ssh_pooled = _ssh_client()
+            _ssh_pkey = key
+        return _ssh_pooled
+
+
+def _ssh_drop():
+    global _ssh_pooled
+    with _ssh_lock:
+        _ssh_pooled = None
+
+
 def prox_exec(cmd, timeout=10):
-    c = _ssh_client()
     try:
-        _, out, _ = c.exec_command(cmd, timeout=timeout)
+        _, out, _ = ssh_client().exec_command(cmd, timeout=timeout)
         return out.read().decode(errors="ignore")
-    finally:
-        c.close()
+    except Exception:
+        _ssh_drop()
+        raise
 
 
 def prox_read(path):
@@ -102,8 +131,8 @@ def prox_read(path):
 
 
 def prox_write(path, data: bytes, backup=True):
-    c = _ssh_client()
     try:
+        c = ssh_client()
         if backup:
             c.exec_command(f"cp -f {shlex.quote(path)} {shlex.quote(path + '.bak')} 2>/dev/null", timeout=10)
         sftp = c.open_sftp()
@@ -112,31 +141,32 @@ def prox_write(path, data: bytes, backup=True):
                 f.write(data)
         finally:
             sftp.close()
-    finally:
-        c.close()
+    except Exception:
+        _ssh_drop()
+        raise
 
 
 def prox_rm(path):
-    c = _ssh_client()
     try:
-        c.exec_command("rm -f " + shlex.quote(path), timeout=10)
-    finally:
-        c.close()
+        ssh_client().exec_command("rm -f " + shlex.quote(path), timeout=10)
+    except Exception:
+        _ssh_drop()
+        raise
 
 
 def prox_get(remote, local):
     d = os.path.dirname(local)
     if d:
         os.makedirs(d, exist_ok=True)
-    c = _ssh_client()
     try:
-        sftp = c.open_sftp()
+        sftp = ssh_client().open_sftp()
         try:
             sftp.get(remote, local)
         finally:
             sftp.close()
-    finally:
-        c.close()
+    except Exception:
+        _ssh_drop()
+        raise
 
 
 def read_text(path):
@@ -166,13 +196,34 @@ def remove_file(path):
         pass
 
 
+_db_cache_ts = 0
+
+
 def open_db(db):
-    """Local sqlite, or SFTP-downloaded copy in remote mode (tiny file, cached per call)."""
+    """Local sqlite, or SFTP-downloaded copy in remote mode (re-pulled every 30s max)."""
+    global _db_cache_ts
     if not is_remote():
         return sqlite3.connect(db)
     local = "/tmp/nastemp-remote.db"
-    prox_get(db, local)
+    if time.time() - _db_cache_ts > 30 or not os.path.exists(local):
+        prox_get(db, local)
+        _db_cache_ts = time.time()
     return sqlite3.connect(local)
+
+
+_cfg_cache = {"ts": 0, "data": None}
+
+
+def load_cfg_cached(ttl=60):
+    if time.time() - _cfg_cache["ts"] < ttl and _cfg_cache["data"] is not None:
+        return _cfg_cache["data"]
+    cfg = load_cfg()
+    _cfg_cache.update(ts=time.time(), data=cfg)
+    return cfg
+
+
+def invalidate_cfg_cache():
+    _cfg_cache.update(ts=0, data=None)
 
 
 # ---------- probes ----------
@@ -506,13 +557,21 @@ def _proxmox_host_local():
     return _parse_proc(s1, s2, mi, time.time() - t0)
 
 
+_stat_cache = {"t": 0, "raw": None}
+
+
 def _proxmox_host_remote():
-    s1 = prox_exec("cat /proc/stat | head -1")
-    t0 = time.time()
-    time.sleep(0.4)
     s2 = prox_exec("cat /proc/stat | head -1")
     mi = prox_exec("cat /proc/meminfo")
-    return _parse_proc(s1, s2, mi, time.time() - t0)
+    now = time.time()
+    if _stat_cache["raw"] is not None and now - _stat_cache["t"] < 90:
+        res = _parse_proc(_stat_cache["raw"], s2, mi, now - _stat_cache["t"])
+    else:  # first sample: take a second one locally-spaced, then cache it
+        time.sleep(0.4)
+        s3 = prox_exec("cat /proc/stat | head -1")
+        res = _parse_proc(s2, s3, mi, time.time() - now)
+    _stat_cache.update(t=now, raw=s2)
+    return res
 
 
 _metrics_cache: dict = {}
@@ -585,6 +644,43 @@ async def login(req: Request):
 @app.get("/api/status")
 def status(_: bool = Depends(check_auth)):
     return build_status()
+
+
+@app.get("/api/fast")
+def fast(_: bool = Depends(check_auth)):
+    """Sub-second lane: fan PWM + heartbeat only, ONE remote roundtrip (~RTT).
+    Local mode answers instantly; remote mode batches everything into a single
+    SSH exec so the fan gauge can refresh every second."""
+    if not is_remote():
+        cfg = load_cfg_cached()
+        return {"fan": fan_hw(), "hb_age": heartbeat_age(cfg), "where": where()}
+    try:
+        cfg = load_cfg_cached()
+        chan = cfg.get("fan", {}).get("pwm_channel", "pwm2")
+        num = "".join(c for c in chan if c.isdigit()) or "2"
+        hb = cfg["timing"]["heartbeat_file"]
+        out = prox_exec(
+            f"C={shlex.quote(chan)}; H=$(grep -l it87 /sys/class/hwmon/hwmon*/name 2>/dev/null | head -1); "
+            f"B=$(dirname \"$H\" 2>/dev/null); echo P:$(cat \"$B/$C\" 2>/dev/null); "
+            f"echo R:$(cat \"$B/fan{num}_input\" 2>/dev/null); echo H:$(cat {shlex.quote(hb)} 2>/dev/null)")
+        vals = {}
+        for ln in out.splitlines():
+            if len(ln) > 2 and ln[1] == ":" and ln[0] in "PRH":
+                vals[ln[0]] = ln[2:].strip()
+        try:
+            pwm = int(vals.get("P", ""))
+            rpm = int(vals.get("R", "")) if vals.get("R", "").lstrip("-").isdigit() else None
+            fan = {"ok": True, "pwm": pwm, "pct": round(pwm / 2.55, 1), "rpm": rpm}
+        except Exception:
+            fan = {"ok": False, "error": "no it87 pwm on proxmox"}
+        try:
+            hb_age = round(time.time() - float(vals.get("H", "")), 1)
+        except Exception:
+            hb_age = None
+        return {"fan": fan, "hb_age": hb_age, "where": where()}
+    except Exception as e:
+        return {"fan": {"ok": False, "error": f"proxmox ssh: {str(e)[:100]}"},
+                "hb_age": None, "where": where()}
 
 
 @app.get("/stream")
@@ -668,6 +764,7 @@ async def set_config(req: Request, _: bool = Depends(check_auth)):
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"invalid YAML: {e}")
     write_text(cfg_path(), content if content.endswith("\n") else content + "\n")
+    invalidate_cfg_cache()
     return {"ok": True, "note": "saved. Restart controller to apply: docker compose restart controller (or systemctl restart nastemp-controller)."}
 
 
