@@ -1,5 +1,5 @@
 #!/bin/bash
-# nastemp-2 / test_fan.sh - safe manual hardware check on PROXMOX host.
+# smart-nas-fan / test_fan.sh - safe manual hardware check on PROXMOX host.
 # Usage: sudo bash test_fan.sh [pwm_value]
 # Default 140 matches your known-good example.
 set -u

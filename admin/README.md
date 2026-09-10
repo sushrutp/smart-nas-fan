@@ -1,4 +1,4 @@
-# 🌀 nastemp-2 admin — control center (`admin/`)
+# 🌀 smart-nas-fan admin — control center (`admin/`)
 
 Neon web UI + API for the whole project on **`0.0.0.0:6767`**.
 One screen: live flow map, RGB fan, per-drive temps, temp/fan/ntfy graph,
@@ -30,7 +30,7 @@ writes the self-expiring `override.json` for manual control.
 ### A. Docker on the Proxmox host (local mode)
 
 ```bash
-cd nastemp-2
+cd smart-nas-fan
 cp .env.example .env && nano .env   # ADMIN_PASS required — compose fails fast without it
 docker compose up -d --build admin
 # → http://<proxmox-ip>:6767  (login with ADMIN_USER / ADMIN_PASS from .env)
@@ -40,8 +40,8 @@ docker compose up -d --build admin
 
 ```bash
 sudo bash setup.sh   # installs controller + watchdog + admin (venv + systemd unit)
-# setup.sh writes secrets to /opt/nastemp/nastemp.env (0600), generates ADMIN_PASS if unset
-sudo systemctl start nastemp-admin
+# setup.sh writes secrets to /opt/smart-nas-fan/smart-nas-fan.env (0600), generates ADMIN_PASS if unset
+sudo systemctl start smart-nas-fan-admin
 ```
 
 ### C. Docker on another VM/host (remote mode)
@@ -60,14 +60,14 @@ PROXMOX_HOST=192.168.1.2 PROXMOX_USER=root docker compose up -d --build admin
 
 ```bash
 apt install python3-fastapi python3-uvicorn   # + pip install paramiko
-PROXMOX_HOST=192.168.1.2 PROXMOX_USER=root PROXMOX_CONFIG=/opt/nastemp/config.yaml \
+PROXMOX_HOST=192.168.1.2 PROXMOX_USER=root PROXMOX_CONFIG=/opt/smart-nas-fan/config.yaml \
   python3 -m uvicorn app:app --host 0.0.0.0 --port 6767 --app-dir ./admin
 ```
 
 ## Configuration (all via environment — nothing hardcoded)
 
 Secrets live in **`.env`** (root dir, gitignored — copy `.env.example`), native systemd
-reads **`/opt/nastemp/nastemp.env`** (0600, written by `setup.sh`). `config.yaml` only
+reads **`/opt/smart-nas-fan/smart-nas-fan.env`** (0600, written by `setup.sh`). `config.yaml` only
 holds `${VAR}` / `${VAR:-default}` placeholders, expanded at load.
 
 | Var | Default | Needed when | What it does |
@@ -80,7 +80,7 @@ holds `${VAR}` / `${VAR:-default}` placeholders, expanded at load.
 | `PROXMOX_USER` | `root` | remote mode | SSH user on Proxmox |
 | `PROXMOX_PORT` | `22` | custom SSH port | SSH port on Proxmox |
 | `PROXMOX_KEY` | `/root/.ssh/id_ed25519` | remote mode | Key file (mount `~/.ssh:/root/.ssh:ro` in Docker) |
-| `PROXMOX_CONFIG` | `/opt/nastemp/config.yaml` | remote mode | Controller config **on Proxmox** (what the editor edits) |
+| `PROXMOX_CONFIG` | `/opt/smart-nas-fan/config.yaml` | remote mode | Controller config **on Proxmox** (what the editor edits) |
 | `TZ` | `UTC` | cosmetic | Timestamps in logs/UI |
 | `ADMIN_DEBUG` (or `NASTEMP_DEBUG`) | off | debugging | Verbose probe trace, secrets masked (see below) |
 
@@ -127,7 +127,7 @@ Security: keep `:6767` LAN-only behind your firewall, set a strong `ADMIN_PASS`,
 prefer `TRUENAS_API_KEY` env over writing the key into the config file.
 
 Threat model (public repo, homelab use): API keys/passwords live ONLY in `.env` /
-`nastemp.env` (both gitignored — verified, no `.env` or key files are tracked, and the
+`smart-nas-fan.env` (both gitignored — verified, no `.env` or key files are tracked, and the
 full git history was scanned). Debug logs mask secrets (`***lenN`). Bearer tokens are
 32-hex random, `compare_digest`-checked, and **expire after 12h** (SSE `?token=` URLs
 land in access logs — expiry bounds that leak). UI escapes all dynamic strings.

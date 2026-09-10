@@ -1,4 +1,4 @@
-# nastemp-2 — Smart HDD-Temperature Fan Control
+# smart-nas-fan — Smart HDD-Temperature Fan Control
 
 Control Proxmox chassis fans from TrueNAS HDD temperatures. Quiet by default,
 louder only when disks are hot, with hard failsafes so fans can never get
@@ -11,7 +11,7 @@ stuck at high speed.
   (`disk.query` + `disk.temperatures`), SSH + `smartctl` fallback
 - **Visibility:** Home Assistant via MQTT (Mosquitto) + ntfy push alerts +
   neon admin UI on `:6767` (local or remote, see `admin/README.md`)
-- **Secrets:** never in files — `.env` (Docker) / `/opt/nastemp/nastemp.env` (native).
+- **Secrets:** never in files — `.env` (Docker) / `/opt/smart-nas-fan/smart-nas-fan.env` (native).
   Copy `.env.example` → `.env` first.
 - **Policy:** default **40% (PWM 102)**, normal ceiling **~72% (PWM 184)** —
   never 100% in normal regulation. **255 only on critical (≥52 °C).**
@@ -33,7 +33,7 @@ TrueNAS (HDD-only °C: API 443, fallback SSH 22)
                 |-- heartbeat -> watchdog.py (forces 40% if stale)
                 |-- MQTT -> Home Assistant (live + history graphs)
                 |-- ntfy  -> phone/push on failures / step-up / critical / recovery
-                |-- /var/log/nastemp.log + .jsonl + nastemp.db (SQLite history)
+                |-- /var/log/smart-nas-fan.log + .jsonl + smart-nas-fan.db (SQLite history)
                                      |
                               admin UI :6767 (FastAPI, on Proxmox or any VM via SSH)
 ```
@@ -85,7 +85,7 @@ Stepping per 30 s cycle: **+12 up / −6 down**. Step-down additionally requires
 | `requirements.txt` | build | controller deps (`paho-mqtt`, `paramiko`, `pyyaml`, `requests`) |
 | `ARCHITECTURE.md` / `INSTALL.md` / `VERSION` | repo | deep dive / setup guide / release |
 
-MQTT topics (`base: nastemp`): `hdd/<disk>/temp`, `hdd/max_temp`,
+MQTT topics (`base: smart-nas-fan`): `hdd/<disk>/temp`, `hdd/max_temp`,
 `hdd/avg_temp`, `hdd/count`, `hdd/source` (api/ssh), `fan/pwm`, `fan/pct`,
 `fan/rpm`, `fan/target`, `fan/mode` (auto/manual), `status`,
 `event` (JSON, for Logbook), `online` (LWT).
@@ -104,10 +104,10 @@ MQTT topics (`base: nastemp`): `hdd/<disk>/temp`, `hdd/max_temp`,
    ssh-copy-id admin@TRUENAS_IP
    ```
 3. **HA:** Mosquitto broker running. Note broker IP / user / pass.
-4. **ntfy:** your server URL + topic, e.g. `http://192.168.1.5:8080/nastemp`.
+4. **ntfy:** your server URL + topic, e.g. `http://192.168.1.5:8080/smart-nas-fan`.
 5. **Secrets first:** `cp .env.example .env && nano .env`
    (`ADMIN_PASS` required, `TRUENAS_API_KEY`, `MQTT_*`, `NTFY_URL`).
-   Native: `setup.sh` writes them to `/opt/nastemp/nastemp.env` (0600, generates
+   Native: `setup.sh` writes them to `/opt/smart-nas-fan/smart-nas-fan.env` (0600, generates
    `ADMIN_PASS` if you don't provide one).
 
 Hardware sanity (Proxmox, as root):
@@ -124,13 +124,13 @@ echo 102 > $(grep -l "it87" /sys/class/hwmon/hwmon*/name | sed 's/name/pwm2/')
 Direct hardware access, no container overhead. Survives updates (see `INSTALL.md` §3b).
 
 ```bash
-cd nastemp-2
+cd smart-nas-fan
 TRUENAS_API_KEY="..." NTFY_URL="..." ADMIN_PASS="..." sudo -E bash setup.sh
-nano /opt/nastemp/config.yaml   # installed copy — non-secret tuning
-sudo systemctl start nastemp-controller nastemp-watchdog nastemp-admin
-systemctl status nastemp-controller nastemp-watchdog nastemp-admin
-journalctl -u nastemp-controller -f
-tail -f /var/log/nastemp.log
+nano /opt/smart-nas-fan/config.yaml   # installed copy — non-secret tuning
+sudo systemctl start smart-nas-fan-controller smart-nas-fan-watchdog smart-nas-fan-admin
+systemctl status smart-nas-fan-controller smart-nas-fan-watchdog smart-nas-fan-admin
+journalctl -u smart-nas-fan-controller -f
+tail -f /var/log/smart-nas-fan.log
 # UI: http://<proxmox-ip>:6767
 ```
 
@@ -151,7 +151,7 @@ hwmon passthrough, plain Linux box).
 > on any VM — see `admin/README.md` remote mode.)
 
 ```bash
-cd nastemp-2
+cd smart-nas-fan
 mkdir -p logs
 cp .env.example .env && nano .env   # secrets FIRST (compose fails fast without ADMIN_PASS)
 nano config.yaml   # non-secret tuning only
@@ -162,7 +162,7 @@ docker compose logs -f controller
 docker compose logs -f watchdog
 
 # live MQTT check (from any host with mosquitto-clients):
-mosquitto_sub -h MQTT_BROKER -t "nastemp/#" -v
+mosquitto_sub -h MQTT_BROKER -t "smart-nas-fan/#" -v
 ```
 
 Useful overrides (no compose edit needed):
@@ -176,8 +176,8 @@ What compose does:
 - Builds the controller image (`Dockerfile`), runs it twice: `controller`
   (`fan_controller.py`) + `watchdog` (`watchdog.py`), plus `admin`
   (`admin/Dockerfile` → `:6767`).
-- Shares heartbeat via named volume `heartbeat` (`/run/nastemp`).
-- Persists logs to `./logs/` (`/var/log/nastemp.log`, `.jsonl`, `.db`).
+- Shares heartbeat via named volume `heartbeat` (`/run/smart-nas-fan`).
+- Persists logs to `./logs/` (`/var/log/smart-nas-fan.log`, `.jsonl`, `.db`).
 - Mounts `./config.yaml` at `/config/config.yaml` (ro for controller, rw for admin editor).
 - Mounts `~/.ssh` read-only for TrueNAS key auth.
 - Secrets come from `.env` (interpolated into containers, expanded in `config.yaml`).
@@ -210,7 +210,7 @@ included package), then reload MQTT / restart. This creates:
 - `sensor.nas_fan_status` (human line incl. reason), `sensor.nas_fan_event`
   (JSON per change), `sensor.nas_controller_online`
 
-Per-drive: after first run, check MQTT (`nastemp/hdd/+/temp`), add one sensor
+Per-drive: after first run, check MQTT (`smart-nas-fan/hdd/+/temp`), add one sensor
 block per disk (template in `ha_sensors.yaml` comments).
 
 ### 6.2 Dashboard
@@ -241,12 +241,12 @@ recorder:
 ```
 
 Second copy (independent of HA): Proxmox/container local files —
-`/var/log/nastemp.log` (or `./logs/` in Docker):
+`/var/log/smart-nas-fan.log` (or `./logs/` in Docker):
 
 ```bash
-grep EVENT /var/log/nastemp.log
-jq '{ts, max_temp, pwm, action}' /var/log/nastemp.jsonl
-sqlite3 /var/log/nastemp.db "SELECT ts,max_temp,pwm,action FROM readings ORDER BY ts DESC LIMIT 20;"
+grep EVENT /var/log/smart-nas-fan.log
+jq '{ts, max_temp, pwm, action}' /var/log/smart-nas-fan.jsonl
+sqlite3 /var/log/smart-nas-fan.db "SELECT ts,max_temp,pwm,action FROM readings ORDER BY ts DESC LIMIT 20;"
 ```
 
 “How long after the temp dropped did fans step down?” = gap between the
@@ -282,7 +282,7 @@ P12 Pro stalls below ~25–30%, so keep floor at 102.
 | Shorter loud periods | `max_boost_sec: 900` (15 min) |
 | Calmer (fewer toggles) | `hysteresis: 2.0`, `cooldown_down_sec: 420` |
 
-Restart controller after edits (systemd: `systemctl restart nastemp-controller`;
+Restart controller after edits (systemd: `systemctl restart smart-nas-fan-controller`;
 Docker: `docker compose up -d`). Or edit from the admin UI (config editor),
 then restart the controller when it tells you to.
 
@@ -296,9 +296,9 @@ then restart the controller when it tells you to.
 | API 401 / `api_key missing` | key valid? https only? `.env: TRUENAS_API_KEY` set? |
 | `SSH FAIL` | key auth, TrueNAS SSH on, user can run `smartctl` |
 | `no temp parsed` | on TrueNAS: `smartctl -A -j /dev/sda` (needs current smartmontools) |
-| Fans stuck high | watchdog forces 40% ≤5 min; `systemctl status nastemp-controller` / `docker compose logs -f controller`; `cat /run/nastemp/heartbeat` |
+| Fans stuck high | watchdog forces 40% ≤5 min; `systemctl status smart-nas-fan-controller` / `docker compose logs -f controller`; `cat /run/smart-nas-fan/heartbeat` |
 | Docker `permission denied` on `pwm2` | must be `privileged: true` + `/sys/class/hwmon:rw`; else use native install |
-| No HA data | `mosquitto_sub -h BROKER -t "nastemp/#" -v`; check `.env: MQTT_*` |
+| No HA data | `mosquitto_sub -h BROKER -t "smart-nas-fan/#" -v`; check `.env: MQTT_*` |
 | No push | `curl -d test $NTFY_URL`; `ntfy.enabled` + `on_*` flags |
 | Admin login fails | `ADMIN_PASS` set? compose fails fast without it; tokens expire after 12h — just log in again |
 | Still confused | enable debug (`debug: true` / `ADMIN_DEBUG=1` / `NASTEMP_DEBUG=1`), `grep DEBUG` the logs — every URL + decision is traced, secrets masked |

@@ -1,8 +1,8 @@
-# nastemp-2 configuration - all tunable, no code edits needed
+# smart-nas-fan configuration - all tunable, no code edits needed
 # PWM 0-255. 102 = 40%. Default floor 40%, normal ceiling 70-75% (never 100% in normal ops).
 #
 # SECRETS DO NOT LIVE HERE. Values below with ${VAR} come from the environment
-# (Docker: .env file next to docker-compose.yml | native: /opt/nastemp/nastemp.env).
+# (Docker: .env file next to docker-compose.yml | native: /opt/smart-nas-fan/smart-nas-fan.env).
 # Copy .env.example -> .env and fill it in. Syntax: ${VAR} (empty if unset),
 # ${VAR:-default} (fallback). Literal secrets in this file still work, but don't.
 
@@ -53,11 +53,11 @@ timing:
   step_down_pwm: 6        # slower step DOWN (noise-friendly)
   cooldown_down_sec: 300  # must stay cool 5 min before each step-down
   max_boost_sec: 1200     # 20 min: NEVER stay elevated longer without re-justification -> force step-down
-  heartbeat_file: "/run/nastemp/heartbeat"
-  override_file: "/run/nastemp/override.json"  # manual control from admin UI
-  log_file: "/var/log/nastemp.log"
-  jsonl_file: "/var/log/nastemp.jsonl"
-  db_file: "/var/log/nastemp.db"  # SQLite history DB (temps + fan + events), queryable + HA-friendly
+  heartbeat_file: "/run/smart-nas-fan/heartbeat"
+  override_file: "/run/smart-nas-fan/override.json"  # manual control from admin UI
+  log_file: "/var/log/smart-nas-fan.log"
+  jsonl_file: "/var/log/smart-nas-fan.jsonl"
+  db_file: "/var/log/smart-nas-fan.db"  # SQLite history DB (temps + fan + events), queryable + HA-friendly
 
 manual:
   enabled: true
@@ -70,13 +70,13 @@ mqtt:
   port: 1883
   username: "${MQTT_USER}"     # <-- SECRET (if your broker needs auth): set in .env
   password: "${MQTT_PASSWORD}" # <-- SECRET: set in .env
-  base: "nastemp"         # topics: nastemp/fan/pwm, nastemp/hdd/max_temp, nastemp/event, ...
+  base: "smart-nas-fan"         # topics: smart-nas-fan/fan/pwm, smart-nas-fan/hdd/max_temp, smart-nas-fan/event, ...
   retain: true
 
 ntfy:
   enabled: true
   url: "${NTFY_URL}"  # <-- SECRET-ish (topic URL is a bearer secret): set in .env
-  # e.g. "https://ntfy.sh/YOUR-UNGUESSABLE-TOPIC-HERE" or "http://192.168.1.5:8080/nastemp"
+  # e.g. "https://ntfy.sh/YOUR-UNGUESSABLE-TOPIC-HERE" or "http://192.168.1.5:8080/smart-nas-fan"
   on_step_up: true
   on_step_down: false     # set true if you want down-notify (noisy)
   on_failsafe: true

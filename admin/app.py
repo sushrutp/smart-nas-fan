@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""nastemp-2 / admin center — neon control UI on :6767.
+"""smart-nas-fan / admin center — neon control UI on :6767.
 
 Backend: FastAPI. Serves the dashboard, live status APIs, config editor.
 Auth: simple login form -> bearer token (ADMIN_USER / ADMIN_PASS env).
@@ -76,7 +76,7 @@ def _expand_env(obj):
         return _ENV_RE.sub(sub, obj)
     return obj
 
-app = FastAPI(title="nastemp admin", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="smart-nas-fan admin", docs_url=None, redoc_url=None, openapi_url=None)
 
 
 def load_cfg():
@@ -101,7 +101,7 @@ def prox_cfg():
             "user": os.environ.get("PROXMOX_USER", "root"),
             "port": int(os.environ.get("PROXMOX_PORT", "22")),
             "key": os.environ.get("PROXMOX_KEY", "/root/.ssh/id_ed25519"),
-            "config": os.environ.get("PROXMOX_CONFIG", "/opt/nastemp/config.yaml")}
+            "config": os.environ.get("PROXMOX_CONFIG", "/opt/smart-nas-fan/config.yaml")}
 
 
 def is_remote():
@@ -248,7 +248,7 @@ def open_db(db):
     global _db_cache_ts
     if not is_remote():
         return sqlite3.connect(db)
-    local = "/tmp/nastemp-remote.db"
+    local = "/tmp/smart-nas-fan-remote.db"
     if time.time() - _db_cache_ts > 30 or not os.path.exists(local):
         prox_get(db, local)
         _db_cache_ts = time.time()
@@ -513,7 +513,7 @@ def build_status():
     hb = heartbeat_age(cfg)
     mq = cfg.get("mqtt", {})
     mqtt = tcp_ok(mq.get("broker", ""), mq.get("port", 1883)) if mq.get("enabled") else {"ok": None, "error": "disabled"}
-    db_path = cfg["timing"].get("db_file", "/var/log/nastemp.db")
+    db_path = cfg["timing"].get("db_file", "/var/log/smart-nas-fan.db")
     db = db_last(db_path, 60)
     # fan state for UI color/animation
     pct = fan.get("pct") if fan.get("ok") else (db["readings"][-1]["pct"] if db.get("readings") else None)
@@ -782,14 +782,14 @@ def weather(_: bool = Depends(check_auth)):
 @app.get("/api/history")
 def history(limit: int = 120, _: bool = Depends(check_auth)):
     cfg = load_cfg()
-    return db_last(cfg["timing"].get("db_file", "/var/log/nastemp.db"), limit=min(limit, 500))
+    return db_last(cfg["timing"].get("db_file", "/var/log/smart-nas-fan.db"), limit=min(limit, 500))
 
 
 @app.get("/api/drives")
 def drives(limit: int = 120, _: bool = Depends(check_auth)):
     """Per-drive temp series for multi-HDD graphs: {series: {sda: [{ts,temp}]}}."""
     cfg = load_cfg()
-    db = cfg["timing"].get("db_file", "/var/log/nastemp.db")
+    db = cfg["timing"].get("db_file", "/var/log/smart-nas-fan.db")
     try:
         con = open_db(db)
         rows = con.execute(
@@ -840,7 +840,7 @@ async def set_config(req: Request, _: bool = Depends(check_auth)):
     debug(f"config save to {cfg_path()} ({len(content)} chars, {'form-values' if 'values' in body else 'raw'})")
     write_text(cfg_path(), content if content.endswith("\n") else content + "\n")
     invalidate_cfg_cache()
-    return {"ok": True, "note": "saved. Restart controller to apply: docker compose restart controller (or systemctl restart nastemp-controller)."}
+    return {"ok": True, "note": "saved. Restart controller to apply: docker compose restart controller (or systemctl restart smart-nas-fan-controller)."}
 
 
 def ov_path(cfg):
@@ -915,12 +915,12 @@ async def ntfy_test(req: Request, _: bool = Depends(check_auth)):
     n = cfg.get("ntfy", {})
     if not n.get("enabled") or not n.get("url"):
         raise HTTPException(status_code=400, detail="ntfy not configured")
-    msg = str((body or {}).get("message") or "🔔 nastemp TEST alert — push pipeline OK ✅")
+    msg = str((body or {}).get("message") or "🔔 smart-nas-fan TEST alert — push pipeline OK ✅")
     debug(f"ntfy-test POST {n['url']}")
     t0 = time.time()
     try:
         requests.post(n["url"], data=msg.encode("utf-8"), timeout=8,
-                      headers={"Title": "nastemp test", "Priority": "high", "Tags": "bell,test"})
+                      headers={"Title": "smart-nas-fan test", "Priority": "high", "Tags": "bell,test"})
         return {"ok": True, "ms": int((time.time() - t0) * 1000)}
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e)[:160])
@@ -931,7 +931,7 @@ def export(kind: str = "readings", limit: int = 2000, _: bool = Depends(check_au
     debug(f"export kind={kind} limit={limit}")
     """CSV download (opens in Excel): kind=readings|events."""
     cfg = load_cfg()
-    db = cfg["timing"].get("db_file", "/var/log/nastemp.db")
+    db = cfg["timing"].get("db_file", "/var/log/smart-nas-fan.db")
     if kind == "events":
         header = ["ts", "event", "max_temp", "pwm", "why"]
         sql = "SELECT ts,event,max_temp,pwm,why FROM events ORDER BY ts DESC LIMIT ?"
@@ -953,7 +953,7 @@ def export(kind: str = "readings", limit: int = 2000, _: bool = Depends(check_au
     w.writerow(header)
     w.writerows(rows)
     return Response(content=buf.getvalue(), media_type="text/csv",
-                    headers={"Content-Disposition": f"attachment; filename=nastemp-{kind}.csv"})
+                    headers={"Content-Disposition": f"attachment; filename=smart-nas-fan-{kind}.csv"})
 
 
 @app.get("/api/logs")

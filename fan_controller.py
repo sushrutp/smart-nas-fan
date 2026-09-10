@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-nastemp-2 / fan_controller.py
+smart-nas-fan / fan_controller.py
 Runs on PROXMOX host (has /sys/class/hwmon it87 pwm2).
 
 What it does every interval:
@@ -118,7 +118,7 @@ def log_startup(cfg):
 def init_db(cfg):
     """SQLite history DB: readings per cycle + per-drive temps + events. Stdlib only."""
     try:
-        db = cfg["timing"].get("db_file", "/var/log/nastemp.db")
+        db = cfg["timing"].get("db_file", "/var/log/smart-nas-fan.db")
         d = os.path.dirname(db)
         if d:
             os.makedirs(d, exist_ok=True)
@@ -139,7 +139,7 @@ def init_db(cfg):
 
 def log_db(cfg, rec, drive_temps=None, event=None):
     try:
-        db = cfg["timing"].get("db_file", "/var/log/nastemp.db")
+        db = cfg["timing"].get("db_file", "/var/log/smart-nas-fan.db")
         con = sqlite3.connect(db)
         con.execute("INSERT OR REPLACE INTO readings VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (rec.get("ts"), rec.get("source", "unknown"), rec.get("max_temp"),
@@ -538,10 +538,10 @@ class Pub:
             try:
                 debug(cfg, f"MQTT connect {mcfg['broker']}:{mcfg.get('port', 1883)} "
                            f"user={mcfg.get('username') or '(empty)'} base={mcfg.get('base')}")
-                self.m = mqtt.Client(client_id="nastemp-controller", clean_session=True)
+                self.m = mqtt.Client(client_id="smart-nas-fan-controller", clean_session=True)
                 if mcfg.get("username"):
                     self.m.username_pw_set(mcfg["username"], mcfg.get("password", ""))
-                base = mcfg.get("base", "nastemp")
+                base = mcfg.get("base", "smart-nas-fan")
                 self.m.will_set(f"{base}/online", "offline", retain=True)
                 self.m.connect(mcfg["broker"], int(mcfg.get("port", 1883)), 60)
                 self.m.loop_start()
@@ -554,7 +554,7 @@ class Pub:
     def pub(self, sub, val, retain=None):
         if not self.m:
             return
-        base = self.cfg["mqtt"].get("base", "nastemp")
+        base = self.cfg["mqtt"].get("base", "smart-nas-fan")
         try:
             self.m.publish(f"{base}/{sub}", str(val),
                            retain=self.cfg["mqtt"].get("retain", True) if retain is None else retain)
@@ -562,7 +562,7 @@ class Pub:
         except Exception as e:
             debug(self.cfg, f"MQTT publish {sub} failed: {e}")
 
-def ntfy(cfg, msg, title="nastemp", priority="default", tags=""):
+def ntfy(cfg, msg, title="smart-nas-fan", priority="default", tags=""):
     n = cfg.get("ntfy", {})
     if not n.get("enabled") or not n.get("url"):
         return
@@ -593,7 +593,7 @@ def main():
     log_line(cfg, f"boot pwm={F['safe_pwm']} ok={ok} info={info} path={hw.pwm_path} source={cfg['truenas'].get('method','auto')}")
     if not ok:
         ntfy(cfg, f"BOOT FAN WRITE FAILED: {info}. Check it87 module / pwm channel!",
-             title="nastemp BOOT failure", priority="urgent", tags="rotating_light,fan")
+             title="smart-nas-fan BOOT failure", priority="urgent", tags="rotating_light,fan")
     heartbeat(cfg)
     pub.pub("fan/pwm", F["safe_pwm"])
     pub.pub("fan/pct", round(F["safe_pwm"] / 2.55, 1))
@@ -609,8 +609,8 @@ def main():
     boost_start = None         # when we first went above floor
     last_event = "init"
 
-    ntfy(cfg, f"nastemp-2 started. src={cfg['truenas'].get('method','auto')} hdd_only={cfg['truenas'].get('hdd_only',True)} floor={F['floor_pwm']} ceiling={F['ceiling_pwm']} cool={T['cool']}C hot={T['hot']}C",
-         title="nastemp started", tags="fan")
+    ntfy(cfg, f"smart-nas-fan started. src={cfg['truenas'].get('method','auto')} hdd_only={cfg['truenas'].get('hdd_only',True)} floor={F['floor_pwm']} ceiling={F['ceiling_pwm']} cool={T['cool']}C hot={T['hot']}C",
+         title="smart-nas-fan started", tags="fan")
 
     while True:
         loop_start = time.time()
@@ -627,7 +627,7 @@ def main():
             st, down_for = tn_link.report(True)
             if st == "recovered" and cfg["ntfy"].get("on_recovery", True):
                 ntfy(cfg, f"TrueNAS recovered after {int(down_for)}s down. Resuming normal control.",
-                     title="nastemp recovered", tags="white_check_mark,thermometer")
+                     title="smart-nas-fan recovered", tags="white_check_mark,thermometer")
         except Exception as e:
             fails += 1
             valid = {}
@@ -639,7 +639,7 @@ def main():
             st, msg = tn_link.report(False, str(e)[:120])
             if st == "failed" and cfg["ntfy"].get("on_api_fail", True):
                 ntfy(cfg, f"{msg}. Retrying, SSH fallback in auto mode.",
-                     title="nastemp TrueNAS failed", priority="high", tags="warning,thermometer")
+                     title="smart-nas-fan TrueNAS failed", priority="high", tags="warning,thermometer")
                 api_fail_notified = True
 
         # MQTT link check (TCP, every cycle): HA blind is alert-worthy, control continues locally
@@ -650,13 +650,13 @@ def main():
                 st, down_for = mqtt_link.report(True)
                 if st == "recovered" and cfg["ntfy"].get("on_recovery", True):
                     ntfy(cfg, f"MQTT broker {m['broker']} recovered after {int(down_for)}s. HA graphs resume.",
-                         title="nastemp recovered", tags="white_check_mark,antenna")
+                         title="smart-nas-fan recovered", tags="white_check_mark,antenna")
             except Exception as e:
                 st, msg = mqtt_link.report(False, str(e)[:100])
                 log_line(cfg, f"MQTT FAIL: {msg}")
                 if st == "failed":
                     ntfy(cfg, f"{msg}. HA graphs blind — fan control continues locally on Proxmox.",
-                         title="nastemp MQTT failed", priority="high", tags="warning,antenna")
+                         title="smart-nas-fan MQTT failed", priority="high", tags="warning,antenna")
 
         if not valid and fails >= cfg["truenas"].get("fail_threshold", 3):
             # FAILSAFE: TrueNAS lost -> step DOWN to safe, never stuck high
@@ -678,7 +678,7 @@ def main():
                        None, {"ts": event["ts"], "event": "failsafe_step_down",
                               "max_temp": None, "pwm": current, "why": reason})
                 if cfg["ntfy"].get("on_failsafe"):
-                    ntfy(cfg, reason, title="nastemp failsafe", priority="high", tags="warning,fan")
+                    ntfy(cfg, reason, title="smart-nas-fan failsafe", priority="high", tags="warning,fan")
                 last_event = "failsafe"
             else:
                 pub.pub("status", "failsafe holding at safe speed (truenas lost)")
@@ -721,7 +721,7 @@ def main():
                                 "pwm": ov.get("pwm"), "why": msg})
                 if cfg["ntfy"].get("on_recovery", True):
                     ntfy(cfg, "Manual fan override expired. Back to automatic control.",
-                         title="nastemp back to auto", tags="robot,fan")
+                         title="smart-nas-fan back to auto", tags="robot,fan")
             elif ov.get("active"):
                 manual_on, mpwm, mov = True, ov["pwm"], ov
                 if ov["mtime"] != last_ov_sig:
@@ -759,7 +759,7 @@ def main():
                              "pct": round(current / 2.55, 1), "rpm": rpm,
                              "action": action, "why": why}, temps, event)
                 ntfy(cfg, f"Failsafe: boosted >{TM['max_boost_sec']//60}min, stepping down to {current} (temp {max_temp}C)",
-                     title="nastemp max-boost guard", priority="high", tags="warning,fan")
+                     title="smart-nas-fan max-boost guard", priority="high", tags="warning,fan")
         else:
             boost_start = None
 
@@ -811,10 +811,10 @@ def main():
         if st == "failed":
             log_line(cfg, f"PWM FAIL: {msg}")
             ntfy(cfg, f"{msg}. Fan control writes may be broken — check it87 module NOW!",
-                 title="nastemp FAN CONTROL failure", priority="urgent", tags="rotating_light,fan")
+                 title="smart-nas-fan FAN CONTROL failure", priority="urgent", tags="rotating_light,fan")
         elif st == "recovered" and cfg["ntfy"].get("on_recovery", True):
             ntfy(cfg, "Fan PWM readback recovered. Hardware control OK.",
-                 title="nastemp recovered", tags="white_check_mark,fan")
+                 title="smart-nas-fan recovered", tags="white_check_mark,fan")
         if actual is None:
             actual = current
         elif abs(actual - current) > max(TM["step_up_pwm"] * 2, 24):

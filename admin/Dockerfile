@@ -1,4 +1,4 @@
-# nastemp-2 / admin Dockerfile — neon control center on :6767
+# smart-nas-fan / admin Dockerfile — neon control center on :6767
 FROM python:3.12-slim
 WORKDIR /app
 RUN pip install --no-cache-dir fastapi==0.115.* uvicorn==0.30.* pyyaml requests paramiko>=3.0

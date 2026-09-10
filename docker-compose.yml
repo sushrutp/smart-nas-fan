@@ -1,4 +1,4 @@
-# nastemp-2 / docker-compose.yml
+# smart-nas-fan / docker-compose.yml
 # Three services: controller + watchdog (fan control, privileged, /sys rw)
 # + admin (neon control center on 0.0.0.0:6767, no privileged needed).
 # Fan control must run on the Proxmox host (or host with hwmon passthrough).
@@ -6,8 +6,8 @@
 # Layout on Docker host:
 #   ./config.yaml          -> your edited config (controller:ro, admin:rw for editor)
 #   ~/.ssh/                -> SSH keys for TrueNAS fallback (mounted read-only)
-#   ./logs/                -> nastemp.log + nastemp.jsonl + nastemp.db (persisted)
-#   heartbeat volume       -> shared /run/nastemp between all containers
+#   ./logs/                -> smart-nas-fan.log + smart-nas-fan.jsonl + smart-nas-fan.db (persisted)
+#   heartbeat volume       -> shared /run/smart-nas-fan between all containers
 #
 # Secrets live in `.env` (copy `.env.example`), NEVER in this file.
 # Compose auto-loads `./.env`. Start:
@@ -20,8 +20,8 @@
 services:
   controller:
     build: .
-    image: nastemp-2:latest
-    container_name: nastemp-controller
+    image: smart-nas-fan:latest
+    container_name: smart-nas-fan-controller
     command: ["python", "fan_controller.py"]
     privileged: true
     restart: unless-stopped
@@ -41,17 +41,17 @@ services:
       - ./config.yaml:/config/config.yaml:ro
       - ~/.ssh:/root/.ssh:ro
       - ./logs:/var/log
-      - heartbeat:/run/nastemp
+      - heartbeat:/run/smart-nas-fan
       - /sys/class/hwmon:/sys/class/hwmon:rw
 
   watchdog:
-    image: nastemp-2:latest
-    container_name: nastemp-watchdog
+    image: smart-nas-fan:latest
+    container_name: smart-nas-fan-watchdog
     command: ["python", "watchdog.py"]
     privileged: true
     restart: unless-stopped
     environment:
-      NASTEMP_HEARTBEAT: /run/nastemp/heartbeat
+      NASTEMP_HEARTBEAT: /run/smart-nas-fan/heartbeat
       NASTEMP_SAFE_PWM: ${SAFE_PWM:-102}
       NASTEMP_STALE_SEC: ${STALE_SEC:-300}
       NASTEMP_PWM: ${PWM_CHANNEL:-pwm2}
@@ -60,7 +60,7 @@ services:
       TZ: ${TZ:-UTC}
     volumes:
       - ./logs:/var/log
-      - heartbeat:/run/nastemp
+      - heartbeat:/run/smart-nas-fan
       # watchdog finds pwm via /sys, so it needs the same sysfs bind:
       - /sys/class/hwmon:/sys/class/hwmon:rw
 
@@ -70,8 +70,8 @@ services:
 
   admin:
     build: ./admin
-    image: nastemp-admin:latest
-    container_name: nastemp-admin
+    image: smart-nas-fan-admin:latest
+    container_name: smart-nas-fan-admin
     restart: unless-stopped
     ports:
       - "6767:6767"
@@ -88,8 +88,8 @@ services:
       # rw so the UI config editor can save (controller mounts the same file ro):
       - ./config.yaml:/config/config.yaml:rw
       - ./logs:/var/log:ro
-      # rw: UI writes manual fan override (/run/nastemp/override.json), reads heartbeat:
-      - heartbeat:/run/nastemp:rw
+      # rw: UI writes manual fan override (/run/smart-nas-fan/override.json), reads heartbeat:
+      - heartbeat:/run/smart-nas-fan:rw
       # ro: live fan read for the animated 🌀 (no privileged needed):
       - /sys/class/hwmon:/sys/class/hwmon:ro
       # For remote mode only: key to reach Proxmox over SSH:

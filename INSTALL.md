@@ -1,4 +1,4 @@
-# nastemp-2 — Simple INSTALL.md
+# smart-nas-fan — Simple INSTALL.md
 
 ## 0. What goes where (placement)
 
@@ -9,8 +9,8 @@
 | 3 | Telemetry bus | **MQTT broker** (Mosquitto, usually HA add-on) | Note IP/port/user/pass. |
 | 4 | Graphs + history | **Home Assistant** | Paste `ha_sensors.yaml`, merge `ha_dashboard.yaml`. |
 | 5 | Push alerts | **ntfy server** (self-hosted or ntfy.sh) + your phone/browser | Pick a topic URL (see §1). |
-| 6 | History DB (local, no network) | **Proxmox** `/var/log/` (Docker: `./logs/`) | `nastemp.log` + `nastemp.jsonl` + `nastemp.db` — automatic. |
-| 7 | Admin control center 🌀 | **Proxmox** (same host) **or any VM** (remote SSH mode) | `docker compose up -d admin` or `setup.sh` (adds `nastemp-admin` service). `:6767`, login required. See §4b/§4c. |
+| 6 | History DB (local, no network) | **Proxmox** `/var/log/` (Docker: `./logs/`) | `smart-nas-fan.log` + `smart-nas-fan.jsonl` + `smart-nas-fan.db` — automatic. |
+| 7 | Admin control center 🌀 | **Proxmox** (same host) **or any VM** (remote SSH mode) | `docker compose up -d admin` or `setup.sh` (adds `smart-nas-fan-admin` service). `:6767`, login required. See §4b/§4c. |
 
 Fan control NEVER leaves Proxmox. Everything else is poll (outbound) or publish (outbound).
 
@@ -18,10 +18,10 @@ Fan control NEVER leaves Proxmox. Everything else is poll (outbound) or publish 
 
 | # | Needed | How to generate | Example | Where it goes (.env, NEVER in files) |
 |---|---|---|---|---|
-| 1 | **TrueNAS API key** (HDD temps, primary) | TrueNAS UI → Credentials → API Keys → Add → name `nastemp-monitor` → Copy key ONCE (needs `REPORTING_READ` or admin) | `1-abc...xyz` | `.env: TRUENAS_API_KEY=<key>` (+ `TRUENAS_HOST`, `TRUENAS_API_URL` — or keep IPs in config) |
+| 1 | **TrueNAS API key** (HDD temps, primary) | TrueNAS UI → Credentials → API Keys → Add → name `smart-nas-fan-monitor` → Copy key ONCE (needs `REPORTING_READ` or admin) | `1-abc...xyz` | `.env: TRUENAS_API_KEY=<key>` (+ `TRUENAS_HOST`, `TRUENAS_API_URL` — or keep IPs in config) |
 | 2 | **TrueNAS SSH key** (fallback when API down) | On Proxmox: `ssh-keygen -t ed25519 -N ""` then `ssh-copy-id admin@192.168.1.10` | `/root/.ssh/id_ed25519` | Key files on disk (0600); `truenas.key_path` in config. Docker: host `~/.ssh` auto-mounted to `/root/.ssh` |
 | 3 | **MQTT broker login** | HA → Settings → Add-ons → Mosquitto broker → note user/pass | user/pass | `.env: MQTT_BROKER / MQTT_USER / MQTT_PASSWORD` |
-| 4 | **ntfy topic URL** (the "token" — secret URL) | Self-hosted: pick `http://192.168.1.5:8080/nastemp`. Public: `https://ntfy.sh/<pick-unguessable-name>`. Test: `curl -d "test" <URL>` → check phone/web app subscribed to same topic | `http://192.168.1.5:8080/nastemp` | `.env: NTFY_URL=<url>`. Subscribe same topic in ntfy phone app / web |
+| 4 | **ntfy topic URL** (the "token" — secret URL) | Self-hosted: pick `http://192.168.1.5:8080/smart-nas-fan`. Public: `https://ntfy.sh/<pick-unguessable-name>`. Test: `curl -d "test" <URL>` → check phone/web app subscribed to same topic | `http://192.168.1.5:8080/smart-nas-fan` | `.env: NTFY_URL=<url>`. Subscribe same topic in ntfy phone app / web |
 | 5 | **Admin login** | You invent it (`setup.sh` generates one if you don't) | `me` / strong pass | `.env: ADMIN_USER / ADMIN_PASS` (compose refuses to start without it) |
 | 6 | (Optional) HA long history | Nothing to generate — just config | `purge_keep_days: 30` | HA `configuration.yaml` → `recorder:` (see README §6.3) |
 
@@ -33,9 +33,9 @@ No Proxmox token, no Docker token, no HA token needed.
 |---|---|---|---|
 | Proxmox → TrueNAS | TCP **443** (HTTPS API) | `disk.query` + `disk.temperatures` (HDD-only) | yes (`method:auto/api`) |
 | Proxmox → TrueNAS | TCP **22** (SSH) | `smartctl` fallback | yes (`method:auto/ssh`) |
-| Proxmox → MQTT broker | TCP **1883** (or 8883 TLS) | publish `nastemp/#` | yes if `mqtt.enabled:true` |
+| Proxmox → MQTT broker | TCP **1883** (or 8883 TLS) | publish `smart-nas-fan/#` | yes if `mqtt.enabled:true` |
 | Proxmox → ntfy | TCP **80/443/8080** | push alerts | yes if `ntfy.enabled:true` |
-| HA → MQTT broker | TCP **1883** | subscribe `nastemp/#` | yes (often same box) |
+| HA → MQTT broker | TCP **1883** | subscribe `smart-nas-fan/#` | yes (often same box) |
 | You → Docker host | TCP **6767** | admin control center 🌀 (login required) | yes, LAN-only recommended |
 
 Rule of thumb: allow Proxmox out to TrueNAS + broker + ntfy. Only inbound port is **6767** (admin UI) — keep it on LAN, behind your firewall, with a strong `ADMIN_PASS`.
@@ -43,40 +43,53 @@ Rule of thumb: allow Proxmox out to TrueNAS + broker + ntfy. Only inbound port i
 ## 3. Install — Option A: native on Proxmox (recommended)
 
 ```bash
-cd nastemp-2
+cd smart-nas-fan
 TRUENAS_API_KEY="..." NTFY_URL="..." ADMIN_PASS="..." sudo -E bash setup.sh
 # (omit any var: setup.sh generates ADMIN_PASS and prints it once)
-nano /opt/nastemp/config.yaml   # installed copy — non-secret tuning (secrets live in /opt/nastemp/nastemp.env)
-sudo systemctl start nastemp-controller nastemp-watchdog nastemp-admin
-systemctl status nastemp-controller nastemp-watchdog nastemp-admin
+nano /opt/smart-nas-fan/config.yaml   # installed copy — non-secret tuning (secrets live in /opt/smart-nas-fan/smart-nas-fan.env)
+sudo systemctl start smart-nas-fan-controller smart-nas-fan-watchdog smart-nas-fan-admin
+systemctl status smart-nas-fan-controller smart-nas-fan-watchdog smart-nas-fan-admin
 # UI: http://<proxmox-ip>:6767
 ```
 
 ### 3b. Surviving Proxmox updates (no Docker needed, nothing to redo by hand)
 
 - **Normal updates (`apt upgrade`):** `/opt/*`, `/etc/systemd/system`, `/var/log`, your SSH
-  keys and your live `/opt/nastemp/config.yaml` all survive. Nothing to do.
+  keys and your live `/opt/smart-nas-fan/config.yaml` all survive. Nothing to do.
 - **If something breaks after an update** (new kernel/Python), recovery is one command —
   `setup.sh` is idempotent: it rebuilds the isolated venv + units from scratch and
   **never overwrites** your live config:
   ```bash
   cd ~/smart-nas-fan && git pull && sudo bash setup.sh
-  sudo systemctl restart nastemp-controller nastemp-watchdog nastemp-admin
+  sudo systemctl restart smart-nas-fan-controller smart-nas-fan-watchdog smart-nas-fan-admin
   modprobe it87   # only if `grep -H . /sys/class/hwmon/hwmon*/name` lost it87 after a kernel update
   ```
 - **Keep a repo clone on Proxmox** (`git clone git@github.com:sushrutp/smart-nas-fan.git ~/smart-nas-fan`)
   so recovery never depends on re-uploading files.
-- **Back up two files** (everything else is regenerable): `/opt/nastemp/config.yaml`
-  (your keys/settings) and `/var/log/nastemp.db` (history).
+- **Back up two files** (everything else is regenerable): `/opt/smart-nas-fan/config.yaml`
+  (your keys/settings) and `/var/log/smart-nas-fan.db` (history).
 - **Major upgrades** (e.g. PVE 8→9): same recovery command, then verify `python3 --version`
   and re-check the HW test (`bash test_fan.sh 140`).
 - **Zero-footprint alternative:** run only the 2 tiny `.py` scripts on Proxmox and the GUI
   on another VM via remote mode (§4c) — then Proxmox holds almost nothing of ours.
+- **Upgrading from `nastemp-2` (pre-1.12 names):** everything renamed to `smart-nas-fan`
+  — `/opt/nastemp` → `/opt/smart-nas-fan`, units `nastemp-*` → `smart-nas-fan-*`,
+  logs/heartbeat paths, container names, and the MQTT base topic
+  (`nastemp/#` → `smart-nas-fan/#`, so HA re-discovers sensors). Migrate:
+  ```bash
+  sudo systemctl stop nastemp-controller nastemp-watchdog nastemp-admin 2>/dev/null
+  sudo systemctl disable nastemp-controller nastemp-watchdog nastemp-admin 2>/dev/null
+  sudo cp /opt/nastemp/config.yaml /tmp/config-backup.yaml
+  sudo cp /opt/nastemp/nastemp.env /tmp/env-backup 2>/dev/null
+  cd ~/smart-nas-fan && git pull && sudo bash setup.sh
+  # re-apply your settings from the backups, then start the new units
+  ```
+  `NASTEMP_*` env names and `ntok` browser storage intentionally unchanged.
 
 ## 4. Install — Option B: Docker (on Proxmox host with `it87` visible)
 
 ```bash
-cd nastemp-2
+cd smart-nas-fan
 mkdir -p logs
 cp .env.example .env && nano .env   # <-- secrets FIRST (compose fails fast without ADMIN_PASS)
 nano config.yaml   # non-secret tuning only; secrets come from .env
@@ -125,7 +138,7 @@ docker compose up -d --build admin
 
 - Login with those credentials (from `.env` — there are no defaults; compose fails fast without `ADMIN_PASS`).
 - Fan control stays in `controller`; after saving config in the UI, restart it:
-  `docker compose restart controller` (native: `systemctl restart nastemp-controller`).
+  `docker compose restart controller` (native: `systemctl restart smart-nas-fan-controller`).
 - The `admin` container needs no `privileged` (sysfs mounted `:ro` for the fan readout).
 
 ## 4c. Run the GUI on a different VM/host (remote mode)
@@ -140,7 +153,7 @@ ssh-copy-id -i ~/.ssh/id_proxmox root@192.168.1.2  # trust it on Proxmox
 # docker: uncomment the PROXMOX_* env + ~/.ssh mount in compose, then:
 PROXMOX_HOST=192.168.1.2 PROXMOX_USER=root docker compose up -d --build admin
 # native (no docker): apt install python3-fastapi python3-uvicorn + pip install paramiko, then:
-PROXMOX_HOST=192.168.1.2 PROXMOX_USER=root PROXMOX_CONFIG=/opt/nastemp/config.yaml \
+PROXMOX_HOST=192.168.1.2 PROXMOX_USER=root PROXMOX_CONFIG=/opt/smart-nas-fan/config.yaml \
   python3 -m uvicorn app:app --host 0.0.0.0 --port 6767 --app-dir ./admin
 # open: http://<this-vm-ip>:6767  (header shows 📍 remote → 192.168.1.2)
 # custom SSH port: PROXMOX_PORT=2222. Key: PROXMOX_KEY=/root/.ssh/id_ed25519 (default).
@@ -162,7 +175,7 @@ at 97ms regardless of transport.
 
 1. Paste `ha_sensors.yaml` into HA `configuration.yaml` (or package), reload MQTT / restart. New: `sensor.nas_temp_source` (api/ssh), `sensor.nas_hdd_count`.
 2. Dashboard → Edit → Raw → merge `ha_dashboard.yaml`. Key card: **"Temp spike -> Fan rise (SAME axis)"** — temp + fan % share one graph so you see cause → effect.
-3. Per-drive: after first run check `mosquitto_sub -h BROKER -t "nastemp/#" -v`, add one sensor block per `nastemp/hdd/<disk>/temp`.
+3. Per-drive: after first run check `mosquitto_sub -h BROKER -t "smart-nas-fan/#" -v`, add one sensor block per `smart-nas-fan/hdd/<disk>/temp`.
 
 ## 6. How to CHECK the setup (in order, stop at first failure)
 
@@ -181,32 +194,32 @@ ssh admin@192.168.1.10 "smartctl -A /dev/sda | head -20"
 # expect temp line. Fail = key auth / SSH service / smartctl rights.
 
 # 4. Controller live log (Proxmox):
-journalctl -u nastemp-controller -f               # native
+journalctl -u smart-nas-fan-controller -f               # native
 # or: docker compose logs -f controller           # docker
-tail -f /var/log/nastemp.log                     # expect: boot pwm=102 ... source=api, then HOLD/step_up lines
+tail -f /var/log/smart-nas-fan.log                     # expect: boot pwm=102 ... source=api, then HOLD/step_up lines
 # API first-fail -> ntfy alert + SSH fallback (method:auto). 3 fails -> failsafe_step_down + ntfy.
 
 # 5. MQTT (any box with mosquitto-clients):
-mosquitto_sub -h 192.168.1.5 -t "nastemp/#" -v
-# expect: nastemp/hdd/max_temp, nastemp/fan/pwm, nastemp/hdd/source api, nastemp/event ...
+mosquitto_sub -h 192.168.1.5 -t "smart-nas-fan/#" -v
+# expect: smart-nas-fan/hdd/max_temp, smart-nas-fan/fan/pwm, smart-nas-fan/hdd/source api, smart-nas-fan/event ...
 
 # 6. DB (Proxmox):
-sqlite3 /var/log/nastemp.db "SELECT ts,source,max_temp,pwm,action FROM readings ORDER BY ts DESC LIMIT 5;"
-sqlite3 /var/log/nastemp.db "SELECT ts,event,max_temp,pwm FROM events ORDER BY ts DESC LIMIT 5;"
+sqlite3 /var/log/smart-nas-fan.db "SELECT ts,source,max_temp,pwm,action FROM readings ORDER BY ts DESC LIMIT 5;"
+sqlite3 /var/log/smart-nas-fan.db "SELECT ts,event,max_temp,pwm FROM events ORDER BY ts DESC LIMIT 5;"
 
 # 7. ntfy (phone/web) — you get a push for EVERY failure + recovery:
-# restart controller -> "nastemp started". Break TrueNAS key -> "TrueNAS failed ... DOWN since <ts>".
+# restart controller -> "smart-nas-fan started". Break TrueNAS key -> "TrueNAS failed ... DOWN since <ts>".
 # Stop Mosquitto -> "MQTT failed ... HA graphs blind". Unplug pwm (it87 rmmod) -> urgent "FAN CONTROL failure".
 # Fix it -> "recovered after Ns" pushes. Watchdog force-reset -> push if NTFY_URL is set
-#   (native: /opt/nastemp/nastemp.env; docker: .env + NASTEMP_NTFY passthrough).
+#   (native: /opt/smart-nas-fan/smart-nas-fan.env; docker: .env + NASTEMP_NTFY passthrough).
 
 # 8. HA:
 # Developer Tools -> States: sensor.nas_hdd_max_temp, sensor.nas_fan_speed have values.
 # Dashboard NAS Cooling: temp spike and fan % rise on SAME graph; Logbook event timestamps match spikes.
 
 # 9. Debug tracing (when something's unclear, see exact URLs + decisions):
-# controller: set debug: true in /opt/nastemp/config.yaml + restart -> journalctl -u nastemp-controller | grep DEBUG
-# watchdog:   Environment=NASTEMP_DEBUG=1 in unit + restart -> journalctl -u nastemp-watchdog
+# controller: set debug: true in /opt/smart-nas-fan/config.yaml + restart -> journalctl -u smart-nas-fan-controller | grep DEBUG
+# watchdog:   Environment=NASTEMP_DEBUG=1 in unit + restart -> journalctl -u smart-nas-fan-watchdog
 # admin:      ADMIN_DEBUG=1 (env) + restart -> docker compose logs -f admin
 # Secrets print masked (***len); URLs visible. Logs stay local.
 

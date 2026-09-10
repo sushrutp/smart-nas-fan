@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-nastemp-2 / watchdog.py  (Layer-2 failsafe)
+smart-nas-fan / watchdog.py  (Layer-2 failsafe)
 If fan_controller.py dies / hangs / loses TrueNAS for too long,
 heartbeat goes stale -> force fans to SAFE 40% so they NEVER get stuck high.
 
@@ -11,7 +11,7 @@ import os
 import subprocess
 import time
 
-HEARTBEAT = os.environ.get("NASTEMP_HEARTBEAT", "/run/nastemp/heartbeat")
+HEARTBEAT = os.environ.get("NASTEMP_HEARTBEAT", "/run/smart-nas-fan/heartbeat")
 SAFE_PWM = int(os.environ.get("NASTEMP_SAFE_PWM", "102"))
 STALE_SEC = int(os.environ.get("NASTEMP_STALE_SEC", "300"))  # 5 min
 CHECK_SEC = 15
@@ -80,7 +80,7 @@ def main():
                             debug(f"ntfy POST {url}")
                             req = urllib.request.Request(
                                 url, data=f"Watchdog: controller stale {int(age)}s, fans forced to 40%".encode(),
-                                headers={"Title": "nastemp watchdog", "Priority": "high"})
+                                headers={"Title": "smart-nas-fan watchdog", "Priority": "high"})
                             urllib.request.urlopen(req, timeout=8)
                             debug("ntfy sent")
                         except Exception as e:

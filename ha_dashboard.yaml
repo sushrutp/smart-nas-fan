@@ -1,4 +1,4 @@
-# nastemp-2 / Lovelace dashboard (Settings -> Dashboards -> Edit -> Raw -> paste views)
+# smart-nas-fan / Lovelace dashboard (Settings -> Dashboards -> Edit -> Raw -> paste views)
 # KEY IDEA for your ask: temp spike + fan rise MUST share one history-graph card
 # (same time axis) so you see cause -> effect. Two graphs with the same
 # hours_to_show/refresh also line up vertically.
@@ -53,7 +53,7 @@ views:
           Step-DOWN waits for cooldown (default 5 min) + hysteresis 1.5C, then
           steps down slowly. Max-boost guard forces step-down after 20 min.
           Watchdog forces 40% if controller dies. API failure -> ntfy alert.
-          Full history: Proxmox /var/log/nastemp.db (SQLite) + .jsonl + HA recorder.
+          Full history: Proxmox /var/log/smart-nas-fan.db (SQLite) + .jsonl + HA recorder.
       - type: history-graph
         title: Per-drive HDD temps (add your entities)
         hours_to_show: 24
