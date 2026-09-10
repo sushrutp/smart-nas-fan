@@ -71,6 +71,12 @@ services:
       ADMIN_USER: ${ADMIN_USER:-admin}
       ADMIN_PASS: ${ADMIN_PASS:-nastemp}
       TRUENAS_API_KEY: ${TRUENAS_API_KEY:-}
+      # Remote mode (GUI on another VM/host, Proxmox reached over IP via SSH key):
+      # Copy the admin service to your other host, then set:
+      # PROXMOX_HOST: 192.168.1.2      # Proxmox IP — empty = local mode
+      # PROXMOX_USER: root
+      # PROXMOX_KEY: /root/.ssh/id_ed25519
+      # PROXMOX_CONFIG: /opt/nastemp/config.yaml   # controller config ON proxmox
       TZ: ${TZ:-UTC}
     volumes:
       # rw so the UI config editor can save (controller mounts the same file ro):
@@ -80,6 +86,8 @@ services:
       - heartbeat:/run/nastemp:rw
       # ro: live fan read for the animated 🌀 (no privileged needed):
       - /sys/class/hwmon:/sys/class/hwmon:ro
+      # For remote mode only: key to reach Proxmox over SSH:
+      # - ~/.ssh:/root/.ssh:ro
 
 volumes:
   heartbeat:

@@ -13,6 +13,7 @@ import csv
 import json
 import os
 import secrets
+import shlex
 import socket
 import sqlite3
 import time
@@ -40,7 +41,7 @@ app = FastAPI(title="nastemp admin", docs_url=None, redoc_url=None, openapi_url=
 
 
 def load_cfg():
-    with open(CFG_PATH) as f:
+    with open(cfg_path(), "r") as f:
         return yaml.safe_load(f)
 
 
@@ -48,6 +49,181 @@ def check_auth(creds: HTTPAuthorizationCredentials = Depends(_auth)):
     if creds is None or creds.credentials not in _tokens:
         raise HTTPException(status_code=401, detail="login required")
     return True
+
+
+# ---------- proxmox access: local files OR remote over SSH ----------
+# Local mode (default): GUI runs on the Proxmox host, reads /sys + /var/log + /run directly.
+# Remote mode: set PROXMOX_HOST -> the SAME files are fetched over SSH (key auth),
+# so the GUI can live on any VM/host with IP access. TrueNAS/MQTT/ntfy/weather
+# are network services and always queried directly.
+
+def prox_cfg():
+    return {"host": os.environ.get("PROXMOX_HOST", ""),
+            "user": os.environ.get("PROXMOX_USER", "root"),
+            "key": os.environ.get("PROXMOX_KEY", "/root/.ssh/id_ed25519"),
+            "config": os.environ.get("PROXMOX_CONFIG", "/opt/nastemp/config.yaml")}
+
+
+def is_remote():
+    return bool(prox_cfg()["host"])
+
+
+def cfg_path():
+    return prox_cfg()["config"] if is_remote() else CFG_PATH
+
+
+def where():
+    p = prox_cfg()
+    return {"mode": "remote" if is_remote() else "local", "proxmox": p["host"] or None}
+
+
+def _ssh_client():
+    import paramiko  # lazy: only required in remote mode (pip install paramiko)
+    p = prox_cfg()
+    c = paramiko.SSHClient()
+    c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    c.connect(hostname=p["host"], username=p["user"],
+              key_filename=os.path.expanduser(p["key"]),
+              timeout=8, banner_timeout=8, auth_timeout=8)
+    return c
+
+
+import threading as _th
+
+_ssh_lock = _th.Lock()
+_ssh_pooled = None
+_ssh_pkey = None
+
+
+def ssh_client():
+    """Persistent SSH connection (reconnects on failure). One handshake, then ~RTT per command."""
+    global _ssh_pooled, _ssh_pkey
+    p = prox_cfg()
+    key = (p["host"], p["user"], p["key"])
+    with _ssh_lock:
+        if _ssh_pooled is None or _ssh_pkey != key:
+            try:
+                _ssh_pooled.close()
+            except Exception:
+                pass
+            _ssh_pooled = _ssh_client()
+            _ssh_pkey = key
+        return _ssh_pooled
+
+
+def _ssh_drop():
+    global _ssh_pooled
+    with _ssh_lock:
+        _ssh_pooled = None
+
+
+def prox_exec(cmd, timeout=10):
+    try:
+        _, out, _ = ssh_client().exec_command(cmd, timeout=timeout)
+        return out.read().decode(errors="ignore")
+    except Exception:
+        _ssh_drop()
+        raise
+
+
+def prox_read(path):
+    return prox_exec("cat " + shlex.quote(path))
+
+
+def prox_write(path, data: bytes, backup=True):
+    try:
+        c = ssh_client()
+        if backup:
+            c.exec_command(f"cp -f {shlex.quote(path)} {shlex.quote(path + '.bak')} 2>/dev/null", timeout=10)
+        sftp = c.open_sftp()
+        try:
+            with sftp.file(path, "w") as f:
+                f.write(data)
+        finally:
+            sftp.close()
+    except Exception:
+        _ssh_drop()
+        raise
+
+
+def prox_rm(path):
+    try:
+        ssh_client().exec_command("rm -f " + shlex.quote(path), timeout=10)
+    except Exception:
+        _ssh_drop()
+        raise
+
+
+def prox_get(remote, local):
+    d = os.path.dirname(local)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    try:
+        sftp = ssh_client().open_sftp()
+        try:
+            sftp.get(remote, local)
+        finally:
+            sftp.close()
+    except Exception:
+        _ssh_drop()
+        raise
+
+
+def read_text(path):
+    if is_remote():
+        return prox_read(path)
+    with open(path) as f:
+        return f.read()
+
+
+def write_text(path, data, backup=True):
+    if is_remote():
+        prox_write(path, data.encode("utf-8"), backup=backup)
+        return
+    if backup and os.path.exists(path):
+        os.rename(path, path + ".bak")
+    with open(path, "w") as f:
+        f.write(data)
+
+
+def remove_file(path):
+    if is_remote():
+        prox_rm(path)
+        return
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+_db_cache_ts = 0
+
+
+def open_db(db):
+    """Local sqlite, or SFTP-downloaded copy in remote mode (re-pulled every 30s max)."""
+    global _db_cache_ts
+    if not is_remote():
+        return sqlite3.connect(db)
+    local = "/tmp/nastemp-remote.db"
+    if time.time() - _db_cache_ts > 30 or not os.path.exists(local):
+        prox_get(db, local)
+        _db_cache_ts = time.time()
+    return sqlite3.connect(local)
+
+
+_cfg_cache = {"ts": 0, "data": None}
+
+
+def load_cfg_cached(ttl=60):
+    if time.time() - _cfg_cache["ts"] < ttl and _cfg_cache["data"] is not None:
+        return _cfg_cache["data"]
+    cfg = load_cfg()
+    _cfg_cache.update(ts=time.time(), data=cfg)
+    return cfg
+
+
+def invalidate_cfg_cache():
+    _cfg_cache.update(ts=0, data=None)
 
 
 # ---------- probes ----------
@@ -105,7 +281,20 @@ def truenas_api(cfg):
         return {"ok": False, "error": str(e)[:160], "latency_ms": int((time.time() - t0) * 1000)}
 
 
-def fan_hw():
+def fan_hw(cfg=None):
+    """Live PWM: local sysfs, or Proxmox sysfs over SSH in remote mode."""
+    res = _fan_hw_local()
+    if res.get("ok"):
+        return res
+    if is_remote():
+        try:
+            return _fan_hw_remote(cfg)
+        except Exception as e:
+            return {"ok": False, "error": f"proxmox ssh: {str(e)[:100]}"}
+    return res
+
+
+def _fan_hw_local():
     """Read live PWM from sysfs (works in container with :ro hwmon mount)."""
     for nf in glob.glob("/sys/class/hwmon/hwmon*/name"):
         try:
@@ -133,11 +322,35 @@ def fan_hw():
     return {"ok": False, "error": "no it87 pwm (native Proxmox only?)"}
 
 
+def _fan_hw_remote(cfg=None):
+    chan = (cfg or {}).get("fan", {}).get("pwm_channel", "pwm2") if isinstance(cfg, dict) else "pwm2"
+    num = "".join(c for c in chan if c.isdigit()) or "2"
+    base = None
+    for nf in prox_exec("ls /sys/class/hwmon/hwmon*/name 2>/dev/null").split():
+        if "it87" in prox_exec("cat " + shlex.quote(nf)):
+            base = os.path.dirname(nf.strip())
+            break
+    if not base:
+        raise RuntimeError("no it87 hwmon on proxmox host")
+    pwm = int(prox_exec(f"cat {base}/{chan}").strip())
+    rpm = None
+    try:
+        rpm = int(prox_exec(f"cat {base}/fan{num}_input").strip())
+    except Exception:
+        pass
+    return {"ok": True, "pwm": pwm, "pct": round(pwm / 2.55, 1), "rpm": rpm}
+
+
 def heartbeat_age(cfg):
     try:
         with open(cfg["timing"]["heartbeat_file"]) as f:
             return round(time.time() - float(f.read().strip()), 1)
     except Exception:
+        if is_remote():
+            try:
+                return round(time.time() - float(prox_read(cfg["timing"]["heartbeat_file"]).strip()), 1)
+            except Exception:
+                pass
         return None
 
 
@@ -152,7 +365,7 @@ def tcp_ok(host, port, timeout=3):
 
 def db_last(db, limit=60):
     try:
-        con = sqlite3.connect(db)
+        con = open_db(db)
         rows = con.execute(
             "SELECT ts,max_temp,pwm,pct,action FROM readings ORDER BY ts DESC LIMIT ?",
             (limit,)).fetchall()
@@ -170,7 +383,7 @@ def db_last(db, limit=60):
 def boost_info(db_path):
     """Last boosted (step_up/emergency) + last boosted-down (step_down/failsafe) for the ms timer."""
     try:
-        con = sqlite3.connect(db_path)
+        con = open_db(db_path)
         up = con.execute(
             "SELECT ts,event,max_temp,pwm FROM events WHERE event IN "
             "('step_up','emergency','failsafe_maxboost_stepdown','maxboost_stepdown') "
@@ -245,7 +458,7 @@ def build_status():
     cfg = load_cfg()
     t = cfg.get("truenas", {})
     tn = truenas_api(cfg)
-    fan = fan_hw()
+    fan = fan_hw(cfg)
     hb = heartbeat_age(cfg)
     mq = cfg.get("mqtt", {})
     mqtt = tcp_ok(mq.get("broker", ""), mq.get("port", 1883)) if mq.get("enabled") else {"ok": None, "error": "disabled"}
@@ -267,6 +480,7 @@ def build_status():
     return {
         "ts": now,
         "version": VERSION,
+        "where": where(),
         "truenas": {**tn, "mode": t.get("method", "auto"), "host": t.get("host")},
         "fan": {**fan, "pct": pct, "state": state,
                 "target": db["readings"][-1]["pwm"] if db.get("readings") else None},
@@ -299,28 +513,65 @@ def _tn_req(cfg, method, params, timeout=12):
 
 
 def proxmox_host():
-    """Lightweight CPU% + RAM% of the box running this UI (Proxmox/Docker host). Stdlib only."""
+    """CPU% + RAM% of the Proxmox box: local /proc, or over SSH in remote mode."""
+    if is_remote():
+        try:
+            return _proxmox_host_remote()
+        except Exception as e:
+            return {"ok": False, "error": f"proxmox ssh: {str(e)[:100]}"}
     try:
-        def times():
-            with open("/proc/stat") as f:
-                return list(map(int, f.readline().split()[1:8]))
-        a, t0 = times(), time.time()
-        time.sleep(0.4)
-        b = times()
-        idle = (b[3] + b[4]) - (a[3] + a[4])
-        cpu = round(100 * (1 - idle / max(1, sum(b) - sum(a))), 1)
-        mem = {}
-        with open("/proc/meminfo") as f:
-            for ln in f:
-                k, v = ln.split(":")
-                mem[k] = int(v.split()[0])
-        avail = mem.get("MemAvailable", mem["MemFree"])
-        ram = round(100 * (1 - avail / mem["MemTotal"]), 1)
-        return {"ok": True, "cpu": cpu, "ram": ram,
-                "ram_used_gb": round((mem["MemTotal"] - avail) / 1048576, 1),
-                "sample_s": round(time.time() - t0, 2)}
+        return _proxmox_host_local()
     except Exception as e:
         return {"ok": False, "error": str(e)[:100]}
+
+
+def _parse_proc(stat1, stat2, meminfo, dt):
+    a = list(map(int, stat1.split()[1:8]))
+    b = list(map(int, stat2.split()[1:8]))
+    idle = (b[3] + b[4]) - (a[3] + a[4])
+    cpu = round(100 * (1 - idle / max(1, sum(b) - sum(a))), 1)
+    mem = {}
+    for ln in meminfo.splitlines():
+        if ":" in ln:
+            k, v = ln.split(":", 1)
+            mem[k] = int(v.split()[0])
+    avail = mem.get("MemAvailable", mem.get("MemFree"))
+    if avail is None or "MemTotal" not in mem:
+        raise RuntimeError("unparseable /proc/meminfo")
+    ram = round(100 * (1 - avail / mem["MemTotal"]), 1)
+    return {"ok": True, "cpu": cpu, "ram": ram,
+            "ram_used_gb": round((mem["MemTotal"] - avail) / 1048576, 1),
+            "sample_s": round(dt, 2)}
+
+
+def _proxmox_host_local():
+    """Lightweight CPU% + RAM% of the box running this UI (Proxmox/Docker host). Stdlib only."""
+    with open("/proc/stat") as f:
+        s1 = f.readline()
+    t0 = time.time()
+    time.sleep(0.4)
+    with open("/proc/stat") as f:
+        s2 = f.readline()
+    with open("/proc/meminfo") as f:
+        mi = f.read()
+    return _parse_proc(s1, s2, mi, time.time() - t0)
+
+
+_stat_cache = {"t": 0, "raw": None}
+
+
+def _proxmox_host_remote():
+    s2 = prox_exec("cat /proc/stat | head -1")
+    mi = prox_exec("cat /proc/meminfo")
+    now = time.time()
+    if _stat_cache["raw"] is not None and now - _stat_cache["t"] < 90:
+        res = _parse_proc(_stat_cache["raw"], s2, mi, now - _stat_cache["t"])
+    else:  # first sample: take a second one locally-spaced, then cache it
+        time.sleep(0.4)
+        s3 = prox_exec("cat /proc/stat | head -1")
+        res = _parse_proc(s2, s3, mi, time.time() - now)
+    _stat_cache.update(t=now, raw=s2)
+    return res
 
 
 _metrics_cache: dict = {}
@@ -395,6 +646,43 @@ def status(_: bool = Depends(check_auth)):
     return build_status()
 
 
+@app.get("/api/fast")
+def fast(_: bool = Depends(check_auth)):
+    """Sub-second lane: fan PWM + heartbeat only, ONE remote roundtrip (~RTT).
+    Local mode answers instantly; remote mode batches everything into a single
+    SSH exec so the fan gauge can refresh every second."""
+    if not is_remote():
+        cfg = load_cfg_cached()
+        return {"fan": fan_hw(), "hb_age": heartbeat_age(cfg), "where": where()}
+    try:
+        cfg = load_cfg_cached()
+        chan = cfg.get("fan", {}).get("pwm_channel", "pwm2")
+        num = "".join(c for c in chan if c.isdigit()) or "2"
+        hb = cfg["timing"]["heartbeat_file"]
+        out = prox_exec(
+            f"C={shlex.quote(chan)}; H=$(grep -l it87 /sys/class/hwmon/hwmon*/name 2>/dev/null | head -1); "
+            f"B=$(dirname \"$H\" 2>/dev/null); echo P:$(cat \"$B/$C\" 2>/dev/null); "
+            f"echo R:$(cat \"$B/fan{num}_input\" 2>/dev/null); echo H:$(cat {shlex.quote(hb)} 2>/dev/null)")
+        vals = {}
+        for ln in out.splitlines():
+            if len(ln) > 2 and ln[1] == ":" and ln[0] in "PRH":
+                vals[ln[0]] = ln[2:].strip()
+        try:
+            pwm = int(vals.get("P", ""))
+            rpm = int(vals.get("R", "")) if vals.get("R", "").lstrip("-").isdigit() else None
+            fan = {"ok": True, "pwm": pwm, "pct": round(pwm / 2.55, 1), "rpm": rpm}
+        except Exception:
+            fan = {"ok": False, "error": "no it87 pwm on proxmox"}
+        try:
+            hb_age = round(time.time() - float(vals.get("H", "")), 1)
+        except Exception:
+            hb_age = None
+        return {"fan": fan, "hb_age": hb_age, "where": where()}
+    except Exception as e:
+        return {"fan": {"ok": False, "error": f"proxmox ssh: {str(e)[:100]}"},
+                "hb_age": None, "where": where()}
+
+
 @app.get("/stream")
 async def stream(token: str = ""):
     """Realtime push over SSE (plain HTTP, auto-reconnect): status JSON every 2s."""
@@ -429,7 +717,7 @@ def drives(limit: int = 120, _: bool = Depends(check_auth)):
     cfg = load_cfg()
     db = cfg["timing"].get("db_file", "/var/log/nastemp.db")
     try:
-        con = sqlite3.connect(db)
+        con = open_db(db)
         rows = con.execute(
             """SELECT ts, drive, temp FROM drive_temps WHERE ts IN
                (SELECT DISTINCT ts FROM drive_temps ORDER BY ts DESC LIMIT ?)
@@ -445,9 +733,8 @@ def drives(limit: int = 120, _: bool = Depends(check_auth)):
 
 @app.get("/api/config")
 def get_config(_: bool = Depends(check_auth)):
-    with open(CFG_PATH) as f:
-        content = f.read()
-    return {"path": CFG_PATH, "content": content, "parsed": yaml.safe_load(content)}
+    content = read_text(cfg_path())
+    return {"path": cfg_path(), "content": content, "parsed": yaml.safe_load(content)}
 
 
 def _set_dotted(cfg, dotted, value):
@@ -463,8 +750,7 @@ def _set_dotted(cfg, dotted, value):
 @app.post("/api/config")
 async def set_config(req: Request, _: bool = Depends(check_auth)):
     body = await req.json()
-    with open(CFG_PATH) as f:
-        current = yaml.safe_load(f)
+    current = yaml.safe_load(read_text(cfg_path()))
     if "values" in body and isinstance(body["values"], dict):
         # easy-form save: merge dotted keys into current yaml (structure preserved)
         for k, v in body["values"].items():
@@ -477,9 +763,8 @@ async def set_config(req: Request, _: bool = Depends(check_auth)):
             yaml.safe_load(content)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"invalid YAML: {e}")
-    os.rename(CFG_PATH, CFG_PATH + ".bak")
-    with open(CFG_PATH, "w") as f:
-        f.write(content if content.endswith("\n") else content + "\n")
+    write_text(cfg_path(), content if content.endswith("\n") else content + "\n")
+    invalidate_cfg_cache()
     return {"ok": True, "note": "saved. Restart controller to apply: docker compose restart controller (or systemctl restart nastemp-controller)."}
 
 
@@ -494,8 +779,7 @@ def manual_state(cfg):
               "ceiling": F["ceiling_pwm"], "max_sec": int(M.get("max_sec", 1800)),
               "enabled": bool(M.get("enabled", True))}
     try:
-        with open(ov_path(cfg)) as f:
-            o = json.load(f)
+        o = json.loads(read_text(ov_path(cfg)))
         pwm = max(bounds["min"], min(255, int(o.get("manual_pwm", 0))))
         until = float(o.get("until", 0))
         if time.time() >= until:
@@ -517,22 +801,23 @@ async def set_manual(req: Request, _: bool = Depends(check_auth)):
     body = await req.json()
     cfg = load_cfg()
     if body.get("auto"):
-        try:
-            os.remove(ov_path(cfg))
-        except Exception:
-            pass
+        remove_file(ov_path(cfg))
         return {**manual_state(cfg), "active": False}
     M = cfg.get("manual", {})
     lo = int(M.get("min_pwm", cfg["fan"]["floor_pwm"]))
     pwm = max(lo, min(255, int(body.get("pwm", lo))))
     secs = max(60, min(int(M.get("max_sec", 1800)), int(body.get("seconds", M.get("max_sec", 1800)))))
     p = ov_path(cfg)
-    d = os.path.dirname(p)
-    if d:
-        os.makedirs(d, exist_ok=True)
-    with open(p, "w") as f:
-        json.dump({"manual_pwm": pwm, "until": time.time() + secs,
-                   "by": str(body.get("by", "admin-ui"))[:40]}, f)
+    if not is_remote():
+        d = os.path.dirname(p)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(p, "w") as f:
+            json.dump({"manual_pwm": pwm, "until": time.time() + secs,
+                       "by": str(body.get("by", "admin-ui"))[:40]}, f)
+    else:
+        prox_write(p, json.dumps({"manual_pwm": pwm, "until": time.time() + secs,
+                                  "by": str(body.get("by", "admin-ui"))[:40]}).encode(), backup=False)
     st = manual_state(cfg)
     st["note"] = (f"Manual PWM {pwm} ({round(pwm/2.55,1)}%) for {secs//60}min. "
                   "Auto-expires, critical temps still win.")
@@ -576,7 +861,7 @@ def export(kind: str = "readings", limit: int = 2000, _: bool = Depends(check_au
         header = ["ts", "source", "max_temp", "avg_temp", "target", "pwm", "pct", "rpm", "action", "why"]
         sql = "SELECT ts,source,max_temp,avg_temp,target,pwm,pct,rpm,action,why FROM readings ORDER BY ts DESC LIMIT ?"
     try:
-        con = sqlite3.connect(db)
+        con = open_db(db)
         try:
             rows = con.execute(sql, (min(limit, 5000),)).fetchall()
         except sqlite3.OperationalError:
@@ -595,6 +880,12 @@ def export(kind: str = "readings", limit: int = 2000, _: bool = Depends(check_au
 @app.get("/api/logs")
 def logs(lines: int = 120, _: bool = Depends(check_auth)):
     cfg = load_cfg()
+    if is_remote():
+        try:
+            tail = prox_exec(f"tail -n {min(lines, 500)} " + shlex.quote(cfg["timing"]["log_file"])).splitlines(keepends=True)
+            return {"ok": True, "lines": tail}
+        except Exception as e:
+            return {"ok": False, "error": f"proxmox ssh: {str(e)[:120]}", "lines": []}
     try:
         with open(cfg["timing"]["log_file"]) as f:
             tail = f.readlines()[-min(lines, 500):]
