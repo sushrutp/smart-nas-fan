@@ -49,6 +49,27 @@ sudo systemctl start nastemp-controller nastemp-watchdog
 systemctl status nastemp-controller nastemp-watchdog
 ```
 
+### 3b. Surviving Proxmox updates (no Docker needed, nothing to redo by hand)
+
+- **Normal updates (`apt upgrade`):** `/opt/*`, `/etc/systemd/system`, `/var/log`, your SSH
+  keys and your live `/opt/nastemp/config.yaml` all survive. Nothing to do.
+- **If something breaks after an update** (new kernel/Python), recovery is one command —
+  `setup.sh` is idempotent: it rebuilds the isolated venv + units from scratch and
+  **never overwrites** your live config:
+  ```bash
+  cd ~/smart-nas-fan && git pull && sudo bash setup.sh
+  sudo systemctl restart nastemp-controller nastemp-watchdog nastemp-admin
+  modprobe it87   # only if `grep -H . /sys/class/hwmon/hwmon*/name` lost it87 after a kernel update
+  ```
+- **Keep a repo clone on Proxmox** (`git clone -b v1.5 git@github.com:sushrutp/smart-nas-fan.git ~/smart-nas-fan`)
+  so recovery never depends on re-uploading files.
+- **Back up two files** (everything else is regenerable): `/opt/nastemp/config.yaml`
+  (your keys/settings) and `/var/log/nastemp.db` (history).
+- **Major upgrades** (e.g. PVE 8→9): same recovery command, then verify `python3 --version`
+  and re-check the HW test (`bash test_fan.sh 140`).
+- **Zero-footprint alternative:** run only the 2 tiny `.py` scripts on Proxmox and the GUI
+  on another VM via remote mode (§4c) — then Proxmox holds almost nothing of ours.
+
 ## 4. Install — Option B: Docker (on Proxmox host with `it87` visible)
 
 ```bash
