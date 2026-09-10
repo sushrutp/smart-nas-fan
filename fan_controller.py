@@ -83,6 +83,38 @@ def log_jsonl(cfg, obj):
     except Exception:
         pass
 
+def debug(cfg, msg):
+    try:
+        if cfg.get("debug"):
+            log_line(cfg, "DEBUG " + msg)
+    except Exception:
+        pass
+
+def _mask(v):
+    s = str(v or "")
+    return "(empty)" if not s else f"***len{len(s)}"
+
+def log_startup(cfg):
+    t, m, n = cfg.get("truenas", {}), cfg.get("mqtt", {}), cfg.get("ntfy", {})
+    F, T, TM = cfg["fan"], cfg["temps_c"], cfg["timing"]
+    log_line(cfg,
+        f"config method={t.get('method')} truenas_host={t.get('host')} api_url={t.get('api_url')} "
+        f"api_key={_mask(t.get('api_key'))} ssh_user={t.get('user')} verify_ssl={t.get('verify_ssl')} "
+        f"hdd_only={t.get('hdd_only')} fail_threshold={t.get('fail_threshold')}")
+    log_line(cfg,
+        f"config mqtt={m.get('broker')}:{m.get('port')} user={m.get('username') or '(empty)'} "
+        f"pass={_mask(m.get('password'))} base={m.get('base')} | "
+        f"ntfy={n.get('url') or '(empty)'} on_up={n.get('on_step_up')} on_fail={n.get('on_failsafe')} "
+        f"on_api={n.get('on_api_fail')} on_rec={n.get('on_recovery')}")
+    log_line(cfg,
+        f"config fan={F['floor_pwm']}..{F['ceiling_pwm']} emg={F['emergency_pwm']} chan={F['pwm_channel']} | "
+        f"temps cool={T['cool']} hot={T['hot']} crit={T['critical']} hyst={T['hysteresis']} | "
+        f"timing every={TM['interval_sec']}s up={TM['step_up_pwm']} down={TM['step_down_pwm']} "
+        f"cooldown={TM['cooldown_down_sec']}s maxboost={TM['max_boost_sec']}s | "
+        f"manual={cfg.get('manual', {}).get('enabled')} weather={cfg.get('weather', {}).get('postcode')}")
+    debug(cfg, f"files log={TM['log_file']} jsonl={TM['jsonl_file']} db={TM.get('db_file')} "
+               f"hb={TM['heartbeat_file']} override={TM.get('override_file')}")
+
 def init_db(cfg):
     """SQLite history DB: readings per cycle + per-drive temps + events. Stdlib only."""
     try:
@@ -288,12 +320,17 @@ def api_post(cfg, method, params=None):
     if not verify:
         requests.packages.urllib3.disable_warnings(
             requests.packages.urllib3.exceptions.InsecureRequestWarning)
+    debug(cfg, f"API POST {url} params={json.dumps(params or [])[:120]} key={_mask(key)}")
+    t0 = time.time()
     r = requests.post(url, json={"method": method, "params": params or []} if False else (params or []),
                       headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                       timeout=t.get("timeout_sec", 8), verify=verify)
     # TrueNAS REST v2 expects raw params array as body for /api/v2.0/<method>.
     r.raise_for_status()
-    return r.json()
+    body = r.json()
+    debug(cfg, f"API {method} <- HTTP {r.status_code} in {int((time.time()-t0)*1000)}ms, "
+               f"{len(body) if isinstance(body, (list, dict)) else '?'} items")
+    return body
 
 def api_hdd_names(cfg):
     """disk.query -> names of spinning HDDs only (type==HDD, rotationrate not null).
@@ -344,6 +381,7 @@ def get_temps_via_api(cfg):
         temps[dev] = round(tv, 1) if tv is not None else None
         if tv is not None:
             valid[dev] = round(tv, 1)
+    debug(cfg, f"API temps: {len(valid)}/{len(names)} HDDs -> {valid}")
     return names, temps, valid, "api"
 
 # ---------- TrueNAS temps via SSH (fallback, HDD-only via lsblk) ----------
@@ -357,10 +395,13 @@ def ssh_exec(cfg, command):
               "banner_timeout": 8, "auth_timeout": 8}
     if key:
         kwargs["key_filename"] = os.path.expanduser(key)
+    debug(cfg, f"SSH {t['user']}@{t['host']}: {command[:140]}")
+    t0 = time.time()
     client.connect(**kwargs)
     try:
         _, stdout, _ = client.exec_command(command, timeout=t.get("timeout_sec", 8))
         out = stdout.read().decode(errors="ignore")
+        debug(cfg, f"SSH <- {len(out)} bytes in {int((time.time()-t0)*1000)}ms")
         return out
     finally:
         client.close()
@@ -495,6 +536,8 @@ class Pub:
         mcfg = cfg.get("mqtt", {})
         if mcfg.get("enabled") and mqtt:
             try:
+                debug(cfg, f"MQTT connect {mcfg['broker']}:{mcfg.get('port', 1883)} "
+                           f"user={mcfg.get('username') or '(empty)'} base={mcfg.get('base')}")
                 self.m = mqtt.Client(client_id="nastemp-controller", clean_session=True)
                 if mcfg.get("username"):
                     self.m.username_pw_set(mcfg["username"], mcfg.get("password", ""))
@@ -503,6 +546,7 @@ class Pub:
                 self.m.connect(mcfg["broker"], int(mcfg.get("port", 1883)), 60)
                 self.m.loop_start()
                 self.m.publish(f"{base}/online", "online", retain=True)
+                debug(cfg, "MQTT connected + LWT set")
             except Exception as e:
                 print(f"MQTT connect failed: {e}", flush=True)
                 self.m = None
@@ -514,16 +558,19 @@ class Pub:
         try:
             self.m.publish(f"{base}/{sub}", str(val),
                            retain=self.cfg["mqtt"].get("retain", True) if retain is None else retain)
-        except Exception:
-            pass
+            debug(self.cfg, f"MQTT -> {base}/{sub} = {str(val)[:100]}")
+        except Exception as e:
+            debug(self.cfg, f"MQTT publish {sub} failed: {e}")
 
 def ntfy(cfg, msg, title="nastemp", priority="default", tags=""):
     n = cfg.get("ntfy", {})
     if not n.get("enabled") or not n.get("url"):
         return
     try:
-        requests.post(n["url"], data=msg.encode("utf-8"), timeout=8,
-                      headers={"Title": title, "Priority": priority, "Tags": tags})
+        debug(cfg, f"ntfy POST {n['url']} title={title!r} priority={priority}")
+        r = requests.post(n["url"], data=msg.encode("utf-8"), timeout=8,
+                          headers={"Title": title, "Priority": priority, "Tags": tags})
+        debug(cfg, f"ntfy <- HTTP {r.status_code}")
     except Exception as e:
         print(f"ntfy failed: {e}", flush=True)
 
@@ -531,6 +578,7 @@ def ntfy(cfg, msg, title="nastemp", priority="default", tags=""):
 
 def main():
     cfg = load_cfg(CFG_PATH)
+    log_startup(cfg)
     init_db(cfg)
     hw = PwmHw(cfg)
     pub = Pub(cfg)

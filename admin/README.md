@@ -123,3 +123,19 @@ at 97ms on any transport.
 
 Security: keep `:6767` LAN-only behind your firewall, set a strong `ADMIN_PASS`,
 prefer `TRUENAS_API_KEY` env over writing the key into the config file.
+
+## Debug logging (what is it connecting to?)
+
+Off by default. Turn on with `ADMIN_DEBUG=1` (or `NASTEMP_DEBUG=1`) on the admin,
+`debug: true` in `config.yaml` for the controller, `NASTEMP_DEBUG=1` for the watchdog:
+
+```bash
+ADMIN_DEBUG=1 python3 -m uvicorn app:app --app-dir ./admin   # startup dump + probe trace
+```
+
+You get: full startup config dump (method/host/API URL/MQTT broker/ntfy URL/file paths),
+every TrueNAS POST + latency, every SSH `user@host: command` + byte count, MQTT
+connect/topics, ntfy POST + HTTP status, weather geocode/forecast URLs, login
+attempts (user + ok/FAIL, never passwords), config/manual/export actions, watchdog
+heartbeat age every 15s. Secrets print masked (`***len17`, never values); URLs do
+appear — logs never leave your host.

@@ -17,6 +17,11 @@ STALE_SEC = int(os.environ.get("NASTEMP_STALE_SEC", "300"))  # 5 min
 CHECK_SEC = 15
 DRV = "it87"
 CHAN = os.environ.get("NASTEMP_PWM", "pwm2")
+DBG = os.environ.get("NASTEMP_DEBUG", "") not in ("", "0", "no", "false")
+
+def debug(msg):
+    if DBG:
+        print(f"WATCHDOG DEBUG: {msg}", flush=True)
 
 def find_pwm():
     for nf in glob.glob("/sys/class/hwmon/hwmon*/name"):
@@ -46,12 +51,16 @@ def force_safe(reason):
         print(f"WATCHDOG FAILED: {e}", flush=True)
 
 def main():
-    print(f"watchdog start: hb={HEARTBEAT} safe={SAFE_PWM} stale>{STALE_SEC}s", flush=True)
+    print(f"watchdog start: hb={HEARTBEAT} safe={SAFE_PWM} stale>{STALE_SEC}s chan={CHAN} drv={DRV}", flush=True)
+    ntfy_url = os.environ.get("NASTEMP_NTFY") or os.environ.get("NTFY_URL") or ""
+    debug(f"config ntfy={'set' if ntfy_url else '(empty, no push on trigger)'} check_every={CHECK_SEC}s "
+          f"pwm_path={find_pwm() or '(not found yet)'}")
     last_forced = 0
     while True:
         try:
             if not os.path.exists(HEARTBEAT):
                 # controller never ran / /run wiped on reboot -> ensure safe once
+                debug("heartbeat file missing")
                 if time.time() - last_forced > 600:
                     force_safe("no heartbeat file")
                     last_forced = time.time()
@@ -59,6 +68,7 @@ def main():
                 with open(HEARTBEAT) as f:
                     ts = float(f.read().strip())
                 age = time.time() - ts
+                debug(f"heartbeat age={age:.1f}s (stale>{STALE_SEC}s)")
                 if age > STALE_SEC and time.time() - last_forced > 300:
                     force_safe(f"heartbeat stale {int(age)}s")
                     last_forced = time.time()
@@ -67,12 +77,14 @@ def main():
                     url = os.environ.get("NASTEMP_NTFY") or os.environ.get("NTFY_URL")
                     if url:
                         try:
+                            debug(f"ntfy POST {url}")
                             req = urllib.request.Request(
                                 url, data=f"Watchdog: controller stale {int(age)}s, fans forced to 40%".encode(),
                                 headers={"Title": "nastemp watchdog", "Priority": "high"})
                             urllib.request.urlopen(req, timeout=8)
-                        except Exception:
-                            pass
+                            debug("ntfy sent")
+                        except Exception as e:
+                            print(f"watchdog ntfy failed: {e}", flush=True)
         except Exception as e:
             print(f"watchdog loop err: {e}", flush=True)
         time.sleep(CHECK_SEC)

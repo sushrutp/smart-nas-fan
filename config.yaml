@@ -6,6 +6,9 @@
 # Copy .env.example -> .env and fill it in. Syntax: ${VAR} (empty if unset),
 # ${VAR:-default} (fallback). Literal secrets in this file still work, but don't.
 
+debug: false   # true = verbose tracing (URLs, per-cycle decisions, probe latencies).
+               # Secrets are masked (***len) but URLs appear — logs stay on your host.
+
 truenas:
   # Source of HDD temps: "api" (TrueNAS HTTP API, HDD-only), "ssh" (smartctl),
   # or "auto" (try API first, fall back to SSH). Recommended: "auto".

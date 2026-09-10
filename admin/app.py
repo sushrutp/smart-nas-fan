@@ -35,8 +35,17 @@ except Exception:
     VERSION = "1.0"
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS") or ""  # NO default password — fail fast if unset
+DEBUG = (os.environ.get("ADMIN_DEBUG", "") or os.environ.get("NASTEMP_DEBUG", "")) not in ("", "0", "no", "false")
 _tokens: set[str] = set()
 _auth = HTTPBearer(auto_error=False)
+
+def debug(msg):
+    if DEBUG:
+        print(f"admin DEBUG: {msg}", flush=True)
+
+def _mask(v):
+    s = str(v or "")
+    return "(empty)" if not s else f"***len{len(s)}"
 
 _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
@@ -139,9 +148,13 @@ def _ssh_drop():
 
 
 def prox_exec(cmd, timeout=10):
+    p = prox_cfg()
+    debug(f"SSH {p['user']}@{p['host']}:{p['port']}: {cmd[:160]}")
     try:
         _, out, _ = ssh_client().exec_command(cmd, timeout=timeout)
-        return out.read().decode(errors="ignore")
+        data = out.read().decode(errors="ignore")
+        debug(f"SSH <- {len(data)} bytes")
+        return data
     except Exception:
         _ssh_drop()
         raise
@@ -263,6 +276,7 @@ def truenas_api(cfg):
     hdr = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     to = min(int(t.get("timeout_sec", 8)), 10)
     t0 = time.time()
+    debug(f"TrueNAS temps via {base} key={_mask(key)} hdd_only={t.get('hdd_only', True)}")
     try:
         q = requests.post(f"{base}/api/v2.0/disk.query", json=[],
                           headers=hdr, timeout=to, verify=verify)
@@ -296,9 +310,11 @@ def truenas_api(cfg):
         if not temps:
             return {"ok": False, "error": "no temps returned", "latency_ms": ms}
         vals = list(temps.values())
+        debug(f"TrueNAS temps ok: {len(vals)} HDDs max={max(vals)} in {ms}ms")
         return {"ok": True, "source": "api", "max": max(vals), "avg": round(sum(vals) / len(vals), 1),
                 "count": len(vals), "temps": temps, "latency_ms": ms}
     except Exception as e:
+        debug(f"TrueNAS temps FAIL: {e}")
         return {"ok": False, "error": str(e)[:160], "latency_ms": int((time.time() - t0) * 1000)}
 
 
@@ -446,9 +462,11 @@ def outside_weather(cfg):
         return {"ok": None, "error": "disabled"}
     now = time.time()
     if _weather_cache.get("ts", 0) > now - 600 and _weather_cache.get("data"):
+        debug("weather: cache hit")
         return _weather_cache["data"]
     try:
         pc, country = w.get("postcode", "33333"), w.get("country", "United States")
+        debug(f"weather: geocode postcode={pc} country={country}")
         g = requests.get("https://geocoding-api.open-meteo.com/v1/search",
                          params={"name": pc, "count": 5, "language": "en", "format": "json"},
                          timeout=8).json()
@@ -465,6 +483,8 @@ def outside_weather(cfg):
                          params={"latitude": place["latitude"], "longitude": place["longitude"],
                                  "current": "temperature_2m,weather_code", "timezone": "auto"},
                          timeout=8).json()["current"]
+        debug(f"weather: forecast lat={place['latitude']} lon={place['longitude']} -> "
+              f"{f.get('temperature_2m')}C code={f.get('weather_code')}")
         code = int(f.get("weather_code", 3))
         data = {"ok": True, "temp": f.get("temperature_2m"),
                 "emoji": WMO_EMOJI.get(code, "🌡️"), "text": WMO_TEXT.get(code, f"code {code}"),
@@ -530,7 +550,10 @@ def _tn_req(cfg, method, params, timeout=12):
                       headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                       timeout=timeout, verify=verify)
     r.raise_for_status()
-    return r.json()
+    body = r.json()
+    debug(f"TrueNAS {method} <- HTTP {r.status_code}, "
+          f"{len(body) if isinstance(body, (list, dict)) else '?'} items")
+    return body
 
 
 def proxmox_host():
@@ -646,6 +669,17 @@ def truenas_metrics(cfg):
 
 # ---------- routes ----------
 
+try:
+    _c0 = load_cfg()
+    _t0, _m0, _n0 = _c0.get("truenas", {}), _c0.get("mqtt", {}), _c0.get("ntfy", {})
+    debug(f"startup v{VERSION} cfg={cfg_path()} where={where()} "
+          f"truenas:{_t0.get('method')}@{_t0.get('host')} api={_t0.get('api_url')} key={_mask(_t0.get('api_key'))} "
+          f"mqtt:{_m0.get('broker')}:{_m0.get('port')} user={_m0.get('username') or '(empty)'} "
+          f"ntfy={_n0.get('url') or '(empty)'} weather={_c0.get('weather', {}).get('postcode')}")
+except Exception as _e:
+    debug(f"startup config not readable yet: {_e}")
+
+
 @app.get("/")
 def index():
     return FileResponse(os.path.join(BASE, "index.html"))
@@ -656,11 +690,14 @@ async def login(req: Request):
     if not ADMIN_PASS:
         raise HTTPException(status_code=503, detail="server misconfigured: set ADMIN_PASS env")
     body = await req.json()
-    if secrets.compare_digest(str(body.get("user", "")), ADMIN_USER) and \
+    user = str(body.get("user", ""))
+    if secrets.compare_digest(user, ADMIN_USER) and \
        secrets.compare_digest(str(body.get("pass", "")), ADMIN_PASS):
         tok = secrets.token_hex(16)
         _tokens.add(tok)
+        debug(f"login ok user={user!r} tokens={len(_tokens)}")
         return {"token": tok}
+    debug(f"login FAIL user={user!r}")
     raise HTTPException(status_code=403, detail="bad credentials")
 
 
@@ -786,6 +823,7 @@ async def set_config(req: Request, _: bool = Depends(check_auth)):
             yaml.safe_load(content)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"invalid YAML: {e}")
+    debug(f"config save to {cfg_path()} ({len(content)} chars, {'form-values' if 'values' in body else 'raw'})")
     write_text(cfg_path(), content if content.endswith("\n") else content + "\n")
     invalidate_cfg_cache()
     return {"ok": True, "note": "saved. Restart controller to apply: docker compose restart controller (or systemctl restart nastemp-controller)."}
@@ -824,9 +862,11 @@ async def set_manual(req: Request, _: bool = Depends(check_auth)):
     body = await req.json()
     cfg = load_cfg()
     if body.get("auto"):
+        debug(f"manual release file={ov_path(cfg)}")
         remove_file(ov_path(cfg))
         return {**manual_state(cfg), "active": False}
     M = cfg.get("manual", {})
+    debug(f"manual set req={ {k: v for k, v in body.items() if k != 'by'} } file={ov_path(cfg)}")
     lo = int(M.get("min_pwm", cfg["fan"]["floor_pwm"]))
     pwm = max(lo, min(255, int(body.get("pwm", lo))))
     secs = max(60, min(int(M.get("max_sec", 1800)), int(body.get("seconds", M.get("max_sec", 1800)))))
@@ -862,6 +902,7 @@ async def ntfy_test(req: Request, _: bool = Depends(check_auth)):
     if not n.get("enabled") or not n.get("url"):
         raise HTTPException(status_code=400, detail="ntfy not configured")
     msg = str((body or {}).get("message") or "🔔 nastemp TEST alert — push pipeline OK ✅")
+    debug(f"ntfy-test POST {n['url']}")
     t0 = time.time()
     try:
         requests.post(n["url"], data=msg.encode("utf-8"), timeout=8,
@@ -873,6 +914,7 @@ async def ntfy_test(req: Request, _: bool = Depends(check_auth)):
 
 @app.get("/api/export")
 def export(kind: str = "readings", limit: int = 2000, _: bool = Depends(check_auth)):
+    debug(f"export kind={kind} limit={limit}")
     """CSV download (opens in Excel): kind=readings|events."""
     cfg = load_cfg()
     db = cfg["timing"].get("db_file", "/var/log/nastemp.db")

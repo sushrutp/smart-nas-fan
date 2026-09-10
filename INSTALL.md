@@ -202,6 +202,12 @@ sqlite3 /var/log/nastemp.db "SELECT ts,event,max_temp,pwm FROM events ORDER BY t
 # Developer Tools -> States: sensor.nas_hdd_max_temp, sensor.nas_fan_speed have values.
 # Dashboard NAS Cooling: temp spike and fan % rise on SAME graph; Logbook event timestamps match spikes.
 
+# 9. Debug tracing (when something's unclear, see exact URLs + decisions):
+# controller: set debug: true in /opt/nastemp/config.yaml + restart -> journalctl -u nastemp-controller | grep DEBUG
+# watchdog:   Environment=NASTEMP_DEBUG=1 in unit + restart -> journalctl -u nastemp-watchdog
+# admin:      ADMIN_DEBUG=1 (env) + restart -> docker compose logs -f admin
+# Secrets print masked (***len); URLs visible. Logs stay local.
+
 # 9. Admin UI down-timers (http://<host>:6767):
 # break any link -> its pill turns 🔴 and a "🔴 <link> down HH:MM:SS.mmm" timer ticks under the flow map.
 # Fix it -> timer clears, "🟢 all links up". Same works in ▶ demo mode (random faults).
