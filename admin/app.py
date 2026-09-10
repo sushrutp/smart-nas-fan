@@ -12,6 +12,7 @@ import io
 import csv
 import json
 import os
+import re
 import secrets
 import shlex
 import socket
@@ -33,16 +34,35 @@ try:
 except Exception:
     VERSION = "1.0"
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "nastemp")
+ADMIN_PASS = os.environ.get("ADMIN_PASS") or ""  # NO default password — fail fast if unset
 _tokens: set[str] = set()
 _auth = HTTPBearer(auto_error=False)
+
+_ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+def _expand_env(obj):
+    """Secrets live in env/.env, never in files: expands $VAR / ${VAR} / ${VAR:-default}."""
+    if isinstance(obj, dict):
+        return {k: _expand_env(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_expand_env(v) for v in obj]
+    if isinstance(obj, str):
+        def sub(m):
+            if m.group(3) is not None:  # $VAR -> "" if unset/empty
+                return os.environ.get(m.group(3), "")
+            v = os.environ.get(m.group(1))  # ${VAR} / ${VAR:-default}
+            if v:
+                return v
+            return m.group(2) if m.group(2) is not None else ""
+        return _ENV_RE.sub(sub, obj)
+    return obj
 
 app = FastAPI(title="nastemp admin", docs_url=None, redoc_url=None, openapi_url=None)
 
 
 def load_cfg():
     with open(cfg_path(), "r") as f:
-        return yaml.safe_load(f)
+        return _expand_env(yaml.safe_load(f))
 
 
 def check_auth(creds: HTTPAuthorizationCredentials = Depends(_auth)):
@@ -633,6 +653,8 @@ def index():
 
 @app.post("/api/login")
 async def login(req: Request):
+    if not ADMIN_PASS:
+        raise HTTPException(status_code=503, detail="server misconfigured: set ADMIN_PASS env")
     body = await req.json()
     if secrets.compare_digest(str(body.get("user", "")), ADMIN_USER) and \
        secrets.compare_digest(str(body.get("pass", "")), ADMIN_PASS):

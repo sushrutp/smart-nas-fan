@@ -1,20 +1,25 @@
 # nastemp-2 configuration - all tunable, no code edits needed
 # PWM 0-255. 102 = 40%. Default floor 40%, normal ceiling 70-75% (never 100% in normal ops).
+#
+# SECRETS DO NOT LIVE HERE. Values below with ${VAR} come from the environment
+# (Docker: .env file next to docker-compose.yml | native: /opt/nastemp/nastemp.env).
+# Copy .env.example -> .env and fill it in. Syntax: ${VAR} (empty if unset),
+# ${VAR:-default} (fallback). Literal secrets in this file still work, but don't.
 
 truenas:
   # Source of HDD temps: "api" (TrueNAS HTTP API, HDD-only), "ssh" (smartctl),
   # or "auto" (try API first, fall back to SSH). Recommended: "auto".
   method: "auto"
-  host: "192.168.1.10"      # <-- CHANGE: TrueNAS IP
+  host: "${TRUENAS_HOST:-192.168.1.10}"
   # --- API mode (HDD-only, no SSD) ---
   # Create key in TrueNAS UI: Credentials -> API Keys -> Add (needs REPORTING_READ).
   # Use https://HOST (HTTP will get the key REVOKED by TrueNAS - use https + verify_ssl:false for self-signed).
-  api_url: "https://192.168.1.10"  # <-- CHANGE: TrueNAS API base URL
-  api_key: ""               # <-- CHANGE: paste TrueNAS API key, or set env TRUENAS_API_KEY
+  api_url: "${TRUENAS_API_URL:-https://192.168.1.10}"
+  api_key: "${TRUENAS_API_KEY}"   # <-- SECRET: set in .env, never here
   verify_ssl: false         # true if you have a valid cert, false for self-signed
   hdd_only: true            # true = ignore SSD/NVMe, control fans from spinning HDDs only
   # --- SSH fallback mode ---
-  user: "admin"              # <-- CHANGE: TrueNAS SSH user (use key auth)
+  user: "${TRUENAS_USER:-admin}"   # key auth; key file via key_path
   key_path: "/root/.ssh/id_ed25519"  # null = default ssh agent/keys
   timeout_sec: 8
   # drives auto-discovered. Override only if autodetect fails:
@@ -58,17 +63,17 @@ manual:
 
 mqtt:
   enabled: true
-  broker: "192.168.1.5"   # <-- CHANGE: HA / Mosquitto IP
+  broker: "${MQTT_BROKER:-192.168.1.5}"
   port: 1883
-  username: ""            # <-- CHANGE if needed, else empty
-  password: ""
+  username: "${MQTT_USER}"     # <-- SECRET (if your broker needs auth): set in .env
+  password: "${MQTT_PASSWORD}" # <-- SECRET: set in .env
   base: "nastemp"         # topics: nastemp/fan/pwm, nastemp/hdd/max_temp, nastemp/event, ...
   retain: true
 
 ntfy:
   enabled: true
-  url: "http://192.168.1.5:8080/nastemp"  # <-- CHANGE: your ntfy server + topic
-  # e.g. "https://ntfy.sh/my-secret-topic-xyz"
+  url: "${NTFY_URL}"  # <-- SECRET-ish (topic URL is a bearer secret): set in .env
+  # e.g. "https://ntfy.sh/my-secret-topic-xyz" or "http://192.168.1.5:8080/nastemp"
   on_step_up: true
   on_step_down: false     # set true if you want down-notify (noisy)
   on_failsafe: true
