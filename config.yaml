@@ -1,90 +1,66 @@
-# smart-nas-fan configuration - all tunable, no code edits needed
-# PWM 0-255. 102 = 40%. Default floor 40%, normal ceiling 70-75% (never 100% in normal ops).
-#
-# SECRETS DO NOT LIVE HERE. Values below with ${VAR} come from the environment
-# (Docker: .env file next to docker-compose.yml | native: /opt/smart-nas-fan/smart-nas-fan.env).
-# Copy .env.example -> .env and fill it in. Syntax: ${VAR} (empty if unset),
-# ${VAR:-default} (fallback). Literal secrets in this file still work, but don't.
-
-debug: false   # true = verbose tracing (URLs, per-cycle decisions, probe latencies).
-               # Secrets are masked (***len) but URLs appear — logs stay on your host.
-
+debug: false
 truenas:
-  # Source of HDD temps: "api" (TrueNAS HTTP API, HDD-only), "ssh" (smartctl),
-  # or "auto" (try API first, fall back to SSH). Recommended: "auto".
-  method: "auto"
-  host: "${TRUENAS_HOST:-192.168.1.10}"
-  # --- API mode (HDD-only, no SSD) ---
-  # Create key in TrueNAS UI: Credentials -> API Keys -> Add (needs REPORTING_READ).
-  # Use https://HOST (HTTP will get the key REVOKED by TrueNAS - use https + verify_ssl:false for self-signed).
-  api_url: "${TRUENAS_API_URL:-https://192.168.1.10}"
-  api_key: "${TRUENAS_API_KEY}"   # <-- SECRET: set in .env, never here
-  verify_ssl: false         # true if you have a valid cert, false for self-signed
-  hdd_only: true            # true = ignore SSD/NVMe, control fans from spinning HDDs only
-  # --- SSH fallback mode ---
-  user: "${TRUENAS_USER:-admin}"   # key auth; key file via key_path
-  key_path: "/root/.ssh/id_ed25519"  # null = default ssh agent/keys
+  method: api
+  api_transport: auto
+  host: ${TRUENAS_HOST:-192.168.1.10}
+  api_url: ${TRUENAS_API_URL:-https://192.168.1.10}
+  api_key: ${TRUENAS_API_KEY}
+  verify_ssl: false
+  hdd_only: true
+  user: ${TRUENAS_USER:-admin}
+  key_path: /root/.ssh/id_ed25519
   timeout_sec: 8
-  # drives auto-discovered. Override only if autodetect fails:
-  drives: []  # e.g. ["/dev/sda","/dev/sdb","/dev/sdc","/dev/sdd"]
-  fail_threshold: 3  # consecutive API/SSH failures before failsafe step-down + ntfy
-
+  drives: []
+  fail_threshold: 3
 fan:
-  pwm_channel: "pwm2"       # matches your: sed 's/name/pwm2/'
-  driver_match: "it87"
-  floor_pct: 40             # default / idle speed
-  floor_pwm: 102            # 255*0.40 = 102
-  ceiling_pct: 72           # normal max - never 100% in normal regulation
-  ceiling_pwm: 184          # 255*0.72 ~= 184
-  emergency_pwm: 255        # ONLY if temp >= temp_critical
-  safe_pwm: 102             # watchdog + failsafe target (40%)
-  pwm_enable_mode: 1        # 1 = manual mode for it87
-
+  pwm_channel: pwm2
+  driver_match: it87
+  floor_pct: 40
+  floor_pwm: 102
+  ceiling_pct: 72
+  ceiling_pwm: 184
+  emergency_pwm: 255
+  safe_pwm: 102
+  pwm_enable_mode: 1
 temps_c:
-  cool: 36.0        # below this -> target = floor
-  warm: 40.0        # start ramping
-  hot: 45.0         # at/above this -> target = ceiling
-  critical: 52.0    # at/above this -> emergency 255 + ntfy critical
-  hysteresis: 1.5   # must drop this much below trigger before stepping down
-
+  cool: 36
+  warm: 40
+  hot: 45
+  critical: 52
+  hysteresis: 1.5
 timing:
   interval_sec: 30
-  step_up_pwm: 12         # how fast we step UP per cycle
-  step_down_pwm: 6        # slower step DOWN (noise-friendly)
-  cooldown_down_sec: 300  # must stay cool 5 min before each step-down
-  max_boost_sec: 1200     # 20 min: NEVER stay elevated longer without re-justification -> force step-down
-  heartbeat_file: "/run/smart-nas-fan/heartbeat"
-  override_file: "/run/smart-nas-fan/override.json"  # manual control from admin UI
-  log_file: "/var/log/smart-nas-fan.log"
-  jsonl_file: "/var/log/smart-nas-fan.jsonl"
-  db_file: "/var/log/smart-nas-fan.db"  # SQLite history DB (temps + fan + events), queryable + HA-friendly
-
+  step_up_pwm: 12
+  step_down_pwm: 6
+  cooldown_down_sec: 300
+  max_boost_sec: 1200
+  heartbeat_file: /run/smart-nas-fan/heartbeat
+  override_file: /run/smart-nas-fan/override.json
+  log_file: /var/log/smart-nas-fan.log
+  jsonl_file: /var/log/smart-nas-fan.jsonl
+  db_file: /var/log/smart-nas-fan.db
 manual:
   enabled: true
-  max_sec: 1800          # manual override auto-expires after 30 min (never stuck)
-  min_pwm: 102           # never below floor — fan stall protection (P12 Pro stalls <25-30%)
-
+  max_sec: 1800
+  min_pwm: 102
 mqtt:
   enabled: true
-  broker: "${MQTT_BROKER:-192.168.1.5}"
+  broker: ${MQTT_BROKER:-192.168.1.5}
   port: 1883
-  username: "${MQTT_USER}"     # <-- SECRET (if your broker needs auth): set in .env
-  password: "${MQTT_PASSWORD}" # <-- SECRET: set in .env
-  base: "smart-nas-fan"         # topics: smart-nas-fan/fan/pwm, smart-nas-fan/hdd/max_temp, smart-nas-fan/event, ...
+  username: ${MQTT_USER}
+  password: ${MQTT_PASSWORD}
+  base: smart-nas-fan
   retain: true
-
 ntfy:
   enabled: true
-  url: "${NTFY_URL}"  # <-- SECRET-ish (topic URL is a bearer secret): set in .env
-  # e.g. "https://ntfy.sh/YOUR-UNGUESSABLE-TOPIC-HERE" or "http://192.168.1.5:8080/smart-nas-fan"
+  url: ${NTFY_URL}
   on_step_up: true
-  on_step_down: false     # set true if you want down-notify (noisy)
+  on_step_down: false
   on_failsafe: true
   on_critical: true
-  on_api_fail: true       # send ntfy when TrueNAS API connection fails (1st fail + failsafe)
-  on_recovery: true       # send ntfy when a failed link (TrueNAS/MQTT/fan) recovers
-
+  on_api_fail: true
+  on_recovery: true
 weather:
   enabled: true
-  postcode: "33333"       # <-- CHANGE: your ZIP for outside temp (Open-Meteo, free, no key)
-  country: "United States"
+  postcode: '33333'
+  country: United States

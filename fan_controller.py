@@ -25,6 +25,7 @@ import os
 import re
 import socket
 import sqlite3
+import ssl
 import subprocess
 import sys
 import time
@@ -98,7 +99,8 @@ def log_startup(cfg):
     t, m, n = cfg.get("truenas", {}), cfg.get("mqtt", {}), cfg.get("ntfy", {})
     F, T, TM = cfg["fan"], cfg["temps_c"], cfg["timing"]
     log_line(cfg,
-        f"config method={t.get('method')} truenas_host={t.get('host')} api_url={t.get('api_url')} "
+        f"config method={t.get('method')} transport={t.get('api_transport', 'auto')} "
+        f"truenas_host={t.get('host')} api_url={t.get('api_url')} "
         f"api_key={_mask(t.get('api_key'))} ssh_user={t.get('user')} verify_ssl={t.get('verify_ssl')} "
         f"hdd_only={t.get('hdd_only')} fail_threshold={t.get('fail_threshold')}")
     log_line(cfg,
@@ -307,9 +309,159 @@ class PwmHw:
 def _api_key(cfg):
     return os.environ.get("TRUENAS_API_KEY") or cfg["truenas"].get("api_key") or ""
 
-def api_post(cfg, method, params=None):
-    """POST https://TRUENAS/api/v2.0/<method> with Bearer API key.
-    method e.g. 'disk.query', 'disk.temperatures'. Raises on any failure."""
+def _truenas_ws_url(cfg):
+    """Derive JSON-RPC WebSocket URL from api_url/host.
+
+    TrueNAS 25.04+ serves JSON-RPC 2.0 at /api/current (legacy /websocket).
+    https://host -> wss://host/api/current, http://host -> ws://host/api/current.
+    Explicit cfg['truenas']['ws_url'] wins when set.
+    """
+    t = cfg["truenas"]
+    if t.get("ws_url"):
+        return t["ws_url"].rstrip("/")
+    base = (t.get("api_url") or f"https://{t['host']}").rstrip("/")
+    if base.startswith("https://"):
+        ws = "wss://" + base[len("https://"):]
+    elif base.startswith("http://"):
+        ws = "ws://" + base[len("http://"):]
+    elif base.startswith(("wss://", "ws://")):
+        ws = base
+    else:
+        ws = "wss://" + base
+    for suffix in ("/api/current", "/api/v2.0", "/api", "/websocket"):
+        if ws.endswith(suffix):
+            ws = ws[:-len(suffix)]
+    return ws.rstrip("/") + "/api/current"
+
+def _ws_recv_matching(ws, req_id, timeout):
+    """Read frames until the response with matching id arrives.
+
+    Server notifications (collection_update / notify_unsubscribed, no matching
+    id) are skipped so a concurrent event can never desync the next call.
+    """
+    deadline = time.time() + max(1, timeout)
+    while True:
+        if time.time() > deadline:
+            raise TimeoutError(f"websocket response timeout for id={req_id}")
+        try:
+            raw = ws.recv()
+        except Exception as e:
+            raise RuntimeError(f"websocket recv failed: {e}")
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            continue  # ignore non-JSON frames
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("id") != req_id:
+            debug_msg = json.dumps(msg)[:160]
+            # notification or unrelated id -> skip, keep waiting
+            try:
+                pass
+            finally:
+                continue
+        if "error" in msg and msg["error"] is not None:
+            err = msg["error"]
+            raise RuntimeError(f"truenas ws error {err.get('code')}: {err.get('message')} "
+                               f"{str(err.get('data', ''))[:200]}")
+        return msg.get("result")
+
+def _ws_connect(cfg):
+    """Open authenticated WS connection. Returns open websocket object.
+
+    Requires `websocket-client` (pip install websocket-client).
+    Raises on missing dep / connect / auth failure.
+    """
+    try:
+        import websocket
+    except ImportError:
+        raise RuntimeError("websocket-client not installed (pip install websocket-client)")
+    t = cfg["truenas"]
+    url = _truenas_ws_url(cfg)
+    timeout = t.get("timeout_sec", 8)
+    verify = bool(t.get("verify_ssl", False))
+    sslopt = {"cert_reqs": ssl.CERT_NONE, "check_hostname": False} if not verify else {}
+    debug(cfg, f"WS connect {url} verify_ssl={verify}")
+    try:
+        ws = websocket.create_connection(url, timeout=timeout, sslopt=sslopt)
+    except Exception as e:
+        raise RuntimeError(f"websocket connect {url} failed: {e}")
+    # Auth per TrueNAS v25.10 docs: auth.login_with_api_key [key] -> true.
+    key = _api_key(cfg)
+    if not key:
+        try:
+            ws.close()
+        except Exception:
+            pass
+        raise RuntimeError("truenas api_key missing (config truenas.api_key or TRUENAS_API_KEY env)")
+    try:
+        ws.send(json.dumps({"jsonrpc": "2.0", "id": 1,
+                            "method": "auth.login_with_api_key", "params": [key]}))
+        result = _ws_recv_matching(ws, 1, timeout)
+    except Exception as e:
+        try:
+            ws.close()
+        except Exception:
+            pass
+        raise RuntimeError(f"truenas ws auth failed: {e}")
+    if result is not True:
+        try:
+            ws.close()
+        except Exception:
+            pass
+        raise RuntimeError(f"truenas ws auth rejected (result={result!r})")
+    return ws
+
+def ws_api_post(cfg, method, params=None):
+    """Single JSON-RPC 2.0 call over WebSocket: connect -> auth -> call -> close."""
+    ws = _ws_connect(cfg)
+    t = cfg["truenas"]
+    timeout = t.get("timeout_sec", 8)
+    try:
+        req_id = 10
+        debug(cfg, f"WS -> {method} params={json.dumps(params or [])[:120]}")
+        t0 = time.time()
+        ws.send(json.dumps({"jsonrpc": "2.0", "id": req_id,
+                            "method": method, "params": params or []}))
+        result = _ws_recv_matching(ws, req_id, timeout)
+        debug(cfg, f"WS {method} <- ok in {int((time.time()-t0)*1000)}ms")
+        return result
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+def ws_api_batch(cfg, calls):
+    """Multiple JSON-RPC calls over ONE WS connection (auth once).
+
+    calls: [(method, params), ...] -> [result, ...] in same order.
+    """
+    ws = _ws_connect(cfg)
+    t = cfg["truenas"]
+    timeout = t.get("timeout_sec", 8)
+    try:
+        results = []
+        req_id = 10
+        for method, params in calls:
+            debug(cfg, f"WS -> {method} params={json.dumps(params or [])[:120]}")
+            ws.send(json.dumps({"jsonrpc": "2.0", "id": req_id,
+                                "method": method, "params": params or []}))
+            results.append(_ws_recv_matching(ws, req_id, timeout))
+            req_id += 1
+        return results
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+def rest_api_post(cfg, method, params=None):
+    """Legacy TrueNAS REST POST https://HOST/api/v2.0/<method>.
+
+    Deprecated since TrueNAS 25.04 (alerts since 25.10.1, removal planned for
+    26). Kept only as fallback when api_transport=auto/rest.
+    """
     t = cfg["truenas"]
     base = (t.get("api_url") or f"https://{t['host']}").rstrip("/")
     key = _api_key(cfg)
@@ -322,7 +474,7 @@ def api_post(cfg, method, params=None):
             requests.packages.urllib3.exceptions.InsecureRequestWarning)
     debug(cfg, f"API POST {url} params={json.dumps(params or [])[:120]} key={_mask(key)}")
     t0 = time.time()
-    r = requests.post(url, json={"method": method, "params": params or []} if False else (params or []),
+    r = requests.post(url, json=params or [],
                       headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                       timeout=t.get("timeout_sec", 8), verify=verify)
     # TrueNAS REST v2 expects raw params array as body for /api/v2.0/<method>.
@@ -332,13 +484,26 @@ def api_post(cfg, method, params=None):
                f"{len(body) if isinstance(body, (list, dict)) else '?'} items")
     return body
 
-def api_hdd_names(cfg):
-    """disk.query -> names of spinning HDDs only (type==HDD, rotationrate not null).
-    Respects hdd_only flag + explicit truenas.drives override."""
+def api_post(cfg, method, params=None):
+    """Dispatcher: JSON-RPC over WS (default) with REST fallback.
+
+    cfg['truenas']['api_transport']: 'auto' (default: WS then REST) |
+    'ws'/'websocket' (WS only) | 'rest' (legacy REST only).
+    """
+    transport = str(cfg["truenas"].get("api_transport", "auto") or "auto").lower()
+    if transport in ("ws", "websocket", "auto"):
+        try:
+            return ws_api_post(cfg, method, params)
+        except Exception as e:
+            if transport != "auto":
+                raise
+            debug(cfg, f"WS {method} failed ({e}), falling back to REST")
+            return rest_api_post(cfg, method, params)
+    return rest_api_post(cfg, method, params)
+
+def _filter_hdd_names(cfg, disks):
+    """Shared HDD-only filter for disk.query results."""
     t = cfg["truenas"]
-    if t.get("drives"):
-        return [d.replace("/dev/", "") for d in t["drives"]]
-    disks = api_post(cfg, "disk.query", [[], {"select": ["name", "type", "rotationrate", "model"]}])
     names = []
     hdd_only = t.get("hdd_only", True)
     for d in disks:
@@ -358,6 +523,15 @@ def api_hdd_names(cfg):
         names = [n for n in names if not n.startswith("nvme")]
     return names
 
+def api_hdd_names(cfg):
+    """disk.query -> names of spinning HDDs only (type==HDD, rotationrate not null).
+    Respects hdd_only flag + explicit truenas.drives override."""
+    t = cfg["truenas"]
+    if t.get("drives"):
+        return [d.replace("/dev/", "") for d in t["drives"]]
+    disks = api_post(cfg, "disk.query", [[], {"select": ["name", "type", "rotationrate", "model"]}])
+    return _filter_hdd_names(cfg, disks)
+
 def parse_api_temp(val):
     """disk.temperatures returns {sda: 38} or {sda: {temperature: 38, ...}}. Normalize to float/None."""
     if isinstance(val, (int, float)):
@@ -369,6 +543,44 @@ def parse_api_temp(val):
     return None
 
 def get_temps_via_api(cfg):
+    t = cfg["truenas"]
+    # Explicit drive list: single temperatures call is enough.
+    if t.get("drives"):
+        names = [d.replace("/dev/", "") for d in t["drives"]]
+        # NOTE: TrueNAS caches disk.temperatures up to 5 min - same value repeats, by design.
+        raw = api_post(cfg, "disk.temperatures", [names, False])
+        temps, valid = {}, {}
+        for n in names:
+            dev = f"/dev/{n}"
+            tv = parse_api_temp(raw.get(n)) if isinstance(raw, dict) else None
+            temps[dev] = round(tv, 1) if tv is not None else None
+            if tv is not None:
+                valid[dev] = round(tv, 1)
+        debug(cfg, f"API temps: {len(valid)}/{len(names)} HDDs -> {valid}")
+        return names, temps, valid, "api"
+    # Fast path: disk.query + disk.temperatures over ONE WS connection
+    # (one TCP+TLS handshake + one auth instead of two). Falls back to two
+    # api_post calls (WS or REST) when transport=rest or WS batch fails.
+    transport = str(t.get("api_transport", "auto") or "auto").lower()
+    if transport in ("ws", "websocket", "auto"):
+        try:
+            disks, raw = _ws_query_then_temps(cfg)
+            names = _filter_hdd_names(cfg, disks)
+            if not names:
+                raise RuntimeError("api disk.query returned no HDDs (hdd_only filter?)")
+            temps, valid = {}, {}
+            for n in names:
+                dev = f"/dev/{n}"
+                tv = parse_api_temp(raw.get(n)) if isinstance(raw, dict) else None
+                temps[dev] = round(tv, 1) if tv is not None else None
+                if tv is not None:
+                    valid[dev] = round(tv, 1)
+            debug(cfg, f"API temps: {len(valid)}/{len(names)} HDDs -> {valid}")
+            return names, temps, valid, "api"
+        except Exception as e:
+            if transport != "auto":
+                raise
+            debug(cfg, f"WS batch failed ({e}), falling back to sequential api_post")
     names = api_hdd_names(cfg)
     if not names:
         raise RuntimeError("api disk.query returned no HDDs (hdd_only filter?)")
@@ -383,6 +595,27 @@ def get_temps_via_api(cfg):
             valid[dev] = round(tv, 1)
     debug(cfg, f"API temps: {len(valid)}/{len(names)} HDDs -> {valid}")
     return names, temps, valid, "api"
+
+def _ws_query_then_temps(cfg):
+    """disk.query then disk.temperatures over a single authenticated WS session."""
+    ws = _ws_connect(cfg)
+    timeout = cfg["truenas"].get("timeout_sec", 8)
+    try:
+        ws.send(json.dumps({"jsonrpc": "2.0", "id": 10, "method": "disk.query",
+                            "params": [[], {"select": ["name", "type", "rotationrate", "model"]}]}))
+        disks = _ws_recv_matching(ws, 10, timeout)
+        names = _filter_hdd_names(cfg, disks if isinstance(disks, list) else [])
+        if not names:
+            return disks, {}
+        ws.send(json.dumps({"jsonrpc": "2.0", "id": 11, "method": "disk.temperatures",
+                            "params": [names, False]}))
+        raw = _ws_recv_matching(ws, 11, timeout)
+        return disks, raw if isinstance(raw, dict) else {}
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
 
 # ---------- TrueNAS temps via SSH (fallback, HDD-only via lsblk) ----------
 
@@ -538,7 +771,16 @@ class Pub:
             try:
                 debug(cfg, f"MQTT connect {mcfg['broker']}:{mcfg.get('port', 1883)} "
                            f"user={mcfg.get('username') or '(empty)'} base={mcfg.get('base')}")
-                self.m = mqtt.Client(client_id="smart-nas-fan-controller", clean_session=True)
+                # paho-mqtt >= 2.0: pass CallbackAPIVersion.VERSION2 or you get
+                # "Callback API version 1 is deprecated". Keep compat with 1.x.
+                try:
+                    _cbv = mqtt.CallbackAPIVersion.VERSION2  # type: ignore[attr-defined]
+                    self.m = mqtt.Client(callback_api_version=_cbv,
+                                         client_id="smart-nas-fan-controller",
+                                         clean_session=True)
+                except (AttributeError, TypeError, ValueError):
+                    self.m = mqtt.Client(client_id="smart-nas-fan-controller",
+                                         clean_session=True)
                 if mcfg.get("username"):
                     self.m.username_pw_set(mcfg["username"], mcfg.get("password", ""))
                 base = mcfg.get("base", "smart-nas-fan")

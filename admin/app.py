@@ -17,6 +17,7 @@ import secrets
 import shlex
 import socket
 import sqlite3
+import ssl
 import time
 from datetime import datetime, timezone
 
@@ -272,6 +273,153 @@ def invalidate_cfg_cache():
 
 # ---------- probes ----------
 
+def _tn_ws_url(cfg):
+    """wss://host/api/current derived from api_url/host (JSON-RPC 2.0, TrueNAS 25.04+)."""
+    t = cfg.get("truenas", {})
+    if t.get("ws_url"):
+        return str(t["ws_url"]).rstrip("/")
+    base = (t.get("api_url") or f"https://{t.get('host', '')}").rstrip("/")
+    if base.startswith("https://"):
+        ws = "wss://" + base[len("https://"):]
+    elif base.startswith("http://"):
+        ws = "ws://" + base[len("http://"):]
+    elif base.startswith(("wss://", "ws://")):
+        ws = base
+    else:
+        ws = "wss://" + base
+    for suffix in ("/api/current", "/api/v2.0", "/api", "/websocket"):
+        if ws.endswith(suffix):
+            ws = ws[:-len(suffix)]
+    return ws.rstrip("/") + "/api/current"
+
+
+def _tn_ws_recv(ws, req_id, timeout):
+    deadline = time.time() + max(1, timeout)
+    while True:
+        if time.time() > deadline:
+            raise TimeoutError(f"websocket response timeout for id={req_id}")
+        msg = json.loads(ws.recv())
+        if not isinstance(msg, dict) or msg.get("id") != req_id:
+            continue  # skip collection_update / notify_unsubscribed notifications
+        if msg.get("error") is not None:
+            err = msg["error"]
+            raise RuntimeError(f"truenas ws error {err.get('code')}: {err.get('message')}")
+        return msg.get("result")
+
+
+def _tn_ws_batch(cfg, calls, timeout=10):
+    """Run [(method, params)] over one authenticated WS session. Returns [result]."""
+    try:
+        import websocket
+    except ImportError:
+        raise RuntimeError("websocket-client not installed")
+    t = cfg.get("truenas", {})
+    key = os.environ.get("TRUENAS_API_KEY") or t.get("api_key") or ""
+    if not key:
+        raise RuntimeError("api_key missing")
+    url = _tn_ws_url(cfg)
+    to = min(int(t.get("timeout_sec", 8)), timeout)
+    verify = bool(t.get("verify_ssl", False))
+    sslopt = {"cert_reqs": ssl.CERT_NONE, "check_hostname": False} if not verify else {}
+    ws = websocket.create_connection(url, timeout=to, sslopt=sslopt)
+    try:
+        ws.send(json.dumps({"jsonrpc": "2.0", "id": 1,
+                            "method": "auth.login_with_api_key", "params": [key]}))
+        if _tn_ws_recv(ws, 1, to) is not True:
+            raise RuntimeError("ws auth rejected")
+        out, rid = [], 10
+        for method, params in calls:
+            ws.send(json.dumps({"jsonrpc": "2.0", "id": rid,
+                                "method": method, "params": params or []}))
+            out.append(_tn_ws_recv(ws, rid, to))
+            rid += 1
+        return out
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+def _tn_transport(cfg):
+    return str(cfg.get("truenas", {}).get("api_transport", "auto") or "auto").lower()
+
+
+def _tn_ws_query_then_temps(cfg, timeout=10):
+    """disk.query + disk.temperatures over one WS session. Returns (disks, raw_temps)."""
+    import websocket
+    t = cfg.get("truenas", {})
+    key = os.environ.get("TRUENAS_API_KEY") or t.get("api_key") or ""
+    if not key:
+        raise RuntimeError("api_key missing")
+    url = _tn_ws_url(cfg)
+    to = min(int(t.get("timeout_sec", 8)), timeout)
+    verify = bool(t.get("verify_ssl", False))
+    sslopt = {"cert_reqs": ssl.CERT_NONE, "check_hostname": False} if not verify else {}
+    ws = websocket.create_connection(url, timeout=to, sslopt=sslopt)
+    try:
+        ws.send(json.dumps({"jsonrpc": "2.0", "id": 1,
+                            "method": "auth.login_with_api_key", "params": [key]}))
+        if _tn_ws_recv(ws, 1, to) is not True:
+            raise RuntimeError("ws auth rejected")
+        ws.send(json.dumps({"jsonrpc": "2.0", "id": 10, "method": "disk.query",
+                            "params": [[], {"select": ["name", "type", "rotationrate", "model"]}]}))
+        disks = _tn_ws_recv(ws, 10, to)
+        names = []
+        for d in disks if isinstance(disks, list) else []:
+            if not isinstance(d, dict) or not d.get("name"):
+                continue
+            dtype = (d.get("type") or "").upper()
+            if (t.get("hdd_only", True) and dtype == "HDD") or (not t.get("hdd_only", True)):
+                if not (t.get("hdd_only", True) and d["name"].startswith("nvme")):
+                    names.append(d["name"])
+            elif dtype == "" and d.get("rotationrate") is not None:
+                names.append(d["name"])
+        if not names:
+            return disks, {}
+        ws.send(json.dumps({"jsonrpc": "2.0", "id": 11, "method": "disk.temperatures",
+                            "params": [names, False]}))
+        raw = _tn_ws_recv(ws, 11, to)
+        return disks, raw if isinstance(raw, dict) else {}
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+def _tn_temps_from_results(cfg, disks, raw, t0):
+    """Build truenas_api() result dict from disk.query + disk.temperatures payloads."""
+    t = cfg.get("truenas", {})
+    names = []
+    for d in disks if isinstance(disks, list) else []:
+        if not isinstance(d, dict) or not d.get("name"):
+            continue
+        dtype = (d.get("type") or "").upper()
+        if (t.get("hdd_only", True) and dtype == "HDD") or (not t.get("hdd_only", True)):
+            if not (t.get("hdd_only", True) and d["name"].startswith("nvme")):
+                names.append(d["name"])
+        elif dtype == "" and d.get("rotationrate") is not None:
+            names.append(d["name"])
+    if not names:
+        return {"ok": False, "error": "no HDDs from disk.query",
+                "latency_ms": int((time.time() - t0) * 1000)}
+    temps = {}
+    for n in names:
+        v = (raw or {}).get(n)
+        tv = float(v) if isinstance(v, (int, float)) else (
+            float(v["temperature"]) if isinstance(v, dict) and isinstance(v.get("temperature"), (int, float)) else None)
+        if tv is not None:
+            temps[f"/dev/{n}"] = round(tv, 1)
+    ms = int((time.time() - t0) * 1000)
+    if not temps:
+        return {"ok": False, "error": "no temps returned", "latency_ms": ms}
+    vals = list(temps.values())
+    debug(f"TrueNAS temps ok (ws): {len(vals)} HDDs max={max(vals)} in {ms}ms")
+    return {"ok": True, "source": "api", "max": max(vals), "avg": round(sum(vals) / len(vals), 1),
+            "count": len(vals), "temps": temps, "latency_ms": ms}
+
+
 def truenas_api(cfg):
     """HDD temps via TrueNAS API. Returns dict with ok/temps/error/latency."""
     t = cfg.get("truenas", {})
@@ -286,8 +434,17 @@ def truenas_api(cfg):
     hdr = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     to = min(int(t.get("timeout_sec", 8)), 10)
     t0 = time.time()
-    debug(f"TrueNAS temps via {base} key={_mask(key)} hdd_only={t.get('hdd_only', True)}")
+    debug(f"TrueNAS temps via {_tn_ws_url(cfg) if _tn_transport(cfg) != 'rest' else base} "
+          f"key={_mask(key)} hdd_only={t.get('hdd_only', True)} transport={_tn_transport(cfg)}")
     try:
+        if _tn_transport(cfg) in ("ws", "websocket", "auto"):
+            try:
+                disks, raw = _tn_ws_query_then_temps(cfg, to)
+                return _tn_temps_from_results(cfg, disks, raw, t0)
+            except Exception as e:
+                if _tn_transport(cfg) != "auto":
+                    raise
+                debug(f"WS failed ({e}), falling back to REST")
         q = requests.post(f"{base}/api/v2.0/disk.query", json=[],
                           headers=hdr, timeout=to, verify=verify)
         q.raise_for_status()
@@ -546,7 +703,20 @@ def build_status():
 
 
 def _tn_req(cfg, method, params, timeout=12):
-    """TrueNAS REST helper shared by metrics calls (api key + https + self-signed)."""
+    """TrueNAS helper: JSON-RPC over WS first, legacy REST fallback.
+
+    REST is deprecated since 25.04 (alerts since 25.10.1). api_transport
+    'ws' forces WS, 'rest' forces REST, 'auto' (default) tries WS then REST.
+    """
+    if _tn_transport(cfg) in ("ws", "websocket", "auto"):
+        try:
+            res = _tn_ws_batch(cfg, [(method, params)], timeout=timeout)
+            debug(f"TrueNAS {method} <- WS ok")
+            return res[0]
+        except Exception as e:
+            if _tn_transport(cfg) != "auto":
+                raise
+            debug(f"TrueNAS {method} WS failed ({e}), REST fallback")
     t = cfg.get("truenas", {})
     key = os.environ.get("TRUENAS_API_KEY") or t.get("api_key") or ""
     if not key:
