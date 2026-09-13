@@ -125,7 +125,8 @@ ntfy flash on new event, shared-axis chart (🌡️ temp + 🌀 fan% + 🔔 ntfy
   temp/humidity via `sensors.topic`, e.g. `zigbee2mqtt/<friendly-name>`).
 - **🔌 plug tile** (Sonoff etc.): live watts + meter total + today/yesterday kWh
   from `sensors.plug_topic` (`power`/`energy` keys, day baselines persisted).
-- Live data pushes over **SSE `/stream`** (auto-reconnect, polling fallback); flow lines are
+- Live data pushes over **one `/ws` websocket** (auto-reconnect with backoff;
+  HTTP polling + legacy SSE only as fallback); flow lines are
   **green = flowing, blue = idle, red glow = broken**, with **⚡ ping ms** on the
   TrueNAS + MQTT arrows.
 - **🎛️ Manual fan control card**: slider (picked up in ≤2s, GUI re-polls instantly) + ⬆️/⬇️ ±10 + 🔥 boost (ceiling) +

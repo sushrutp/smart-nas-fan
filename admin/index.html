@@ -293,14 +293,14 @@ canvas{width:100%;height:260px;background:#060918f2;border:1px solid var(--line)
 
 <script>
 let TOK = sessionStorage.getItem('ntok') || '';
-let DEMO = false, ES = null, lastPush = 0, lastEvAt = 0, whereMode = 'local';
-if (TOK) { document.getElementById('login').style.display = 'none'; connectStream(); }
+let DEMO = false, WS = null, wsBackoff = 1000, lastEvAt = 0, whereMode = 'local';
+if (TOK) { document.getElementById('login').style.display = 'none'; connectWS(); }
 document.getElementById('loginForm').onsubmit = async e => {
   e.preventDefault();
   const r = await fetch('/api/login', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({user: document.getElementById('u').value, pass: document.getElementById('p').value})});
   if (r.ok) { TOK = (await r.json()).token; sessionStorage.setItem('ntok', TOK);
-    document.getElementById('login').style.display = 'none'; connectStream(); tick(); chart(); fetchWeather(); fetchHost(); fetchPlug(); fetchNetlog(); }
+    document.getElementById('login').style.display = 'none'; connectWS(); tick(); chart(); fetchWeather(); fetchHost(); fetchPlug(); fetchNetlog(); }
   else document.getElementById('loginErr').textContent = '❌ wrong credentials';
 };
 document.getElementById('logoutBtn').onclick = () => { sessionStorage.removeItem('ntok'); location.reload(); };
@@ -340,21 +340,43 @@ function trackLinks(oks) {
   }
 }
 
-/* realtime stream (SSE push, polling fallback) */
-function connectStream() {
-  if (DEMO || !TOK) return;
-  try { ES && ES.close(); } catch (e) {}
-  ES = new EventSource('/stream?token=' + encodeURIComponent(TOK));
-  ES.onmessage = ev => { lastPush = Date.now(); try { render(JSON.parse(ev.data)); } catch (e) {} };
-  ES.onerror = () => { /* auto-reconnects; tick() polls meanwhile */ };
+/* live socket GUI<->backend: one connection pushes every feed; the HTTP
+   fetchers below are pure fallback and self-skip while the socket is live */
+const wsLive = () => WS && WS.readyState === 1;
+function connectWS() {
+  if (DEMO || !TOK || !window.WebSocket) return;
+  try { WS && WS.close(); } catch (e) {}
+  WS = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws?token=' + encodeURIComponent(TOK));
+  WS.onopen = () => { wsBackoff = 1000; };
+  WS.onmessage = ev => { try { routeWS(JSON.parse(ev.data)); } catch (e) {} };
+  WS.onclose = () => { WS = null; if (!DEMO && TOK) setTimeout(connectWS, Math.min(wsBackoff *= 2, 15000)); };
+}
+function routeWS(m) {
+  if (!m || !m.type) return;
+  if (m.type === 'pong') return;
+  const d = m.data || {};
+  switch (m.type) {
+    case 'status': if (d.ts) render(d); break;
+    case 'manual': renderManual(d); break;
+    case 'host': renderHost(d); break;
+    case 'weather': renderWeather(d); break;
+    case 'plug': renderPlug(d); break;
+    case 'chart':
+      window._lastReadings = d.readings || []; window._lastEvents = d.events || [];
+      window._lastSeries = d.series || {};
+      drawChart(window._lastReadings, window._lastEvents, window._lastSeries);
+      break;
+    case 'logs': if (d.ok) $('logs').textContent = (d.lines || []).join(''); break;
+    case 'netlog': if (d.ok) $('netlog').textContent = (d.lines || []).join('') || '— no connection events yet —'; break;
+  }
 }
 
 /* demo / live */
 $('mLive').onclick = () => { DEMO = false; $('mLive').classList.add('on'); $('mDemo').classList.remove('on');
   const b = $('modeBadge'); b.textContent = '● LIVE'; b.classList.remove('demo');
   $('manualCard').style.opacity = 1; $('manualCard').querySelectorAll('input,button').forEach(el => el.disabled = false);
-  connectStream(); tick(); chart(); fetchManual(); fetchHost(); };
-$('mDemo').onclick = () => { DEMO = true; simReset(); try { ES && ES.close(); } catch (e) {}
+  connectWS(); tick(); chart(); fetchManual(); fetchHost(); };
+$('mDemo').onclick = () => { DEMO = true; simReset(); try { WS && WS.close(); } catch (e) { WS = null; }
   $('mDemo').classList.add('on'); $('mLive').classList.remove('on');
   const b = $('modeBadge'); b.textContent = '▶ DEMO'; b.classList.add('demo');
   $('manualCard').style.opacity = .45; $('manualCard').querySelectorAll('input,button').forEach(el => el.disabled = true);
@@ -513,7 +535,7 @@ function render(s) {
 
 async function tick() {
   if (DEMO) { render(simStep()); return; }
-  if (Date.now() - lastPush < 6000) return; // stream is feeding us
+  if (wsLive()) return; // socket is pushing status; HTTP is fallback only
   try {
     const s = await (await fetch('/api/status', {headers: H()})).json();
     if (!s.ts) return;
@@ -523,7 +545,7 @@ async function tick() {
   } catch (e) { /* keep last frame */ }
 }
 
-/* ---------- weather (Open-Meteo outside + Zigbee2MQTT room sensor, one tile) ---------- */
+/* ---------- weather (Nominatim outside + Zigbee2MQTT room sensor, one tile) ---------- */
 function driveTrend(name) {
   /* 60s trend from the history series chart() caches in window._lastSeries */
   const pts = (window._lastSeries && window._lastSeries[name]) || [];
@@ -541,6 +563,23 @@ function driveTrend(name) {
   if (d <= -0.5) return {arrow: '⬇️', title: 'falling ' + ds};
   return {arrow: '➡️', title: 'flat ' + ds};
 }
+function renderWeather(w) {
+  if (w.ok) {
+    window._wTemp = w.temp;
+    $('wEmoji').textContent = w.emoji; $('wTemp').textContent = w.temp + '°C';
+    $('wText').textContent = w.text; $('wPc').textContent = `· ${w.postcode} ${w.place || ''}`;
+    if (window._lastMax != null) {
+      const d = (window._lastMax - w.temp).toFixed(1);
+      $('wDelta').textContent = `HDD max ${d >= 0 ? '+' : ''}${d}°C vs outside`;
+    }
+  } else { $('wEmoji').textContent = '⚪'; $('wText').textContent = w.error || 'off'; }
+  const indoor = w.indoor;
+  if (indoor && indoor.ok) {
+    $('wDelta').textContent += `${$('wDelta').textContent ? ' · ' : ''}🏠 ${indoor.temp}°C${indoor.humidity != null ? ` 💧 ${indoor.humidity}%` : ''} (room${indoor.age_s != null ? `, ${indoor.age_s}s ago` : ''})`;
+  } else if (indoor && indoor.ok === false) {
+    $('wDelta').textContent += `${$('wDelta').textContent ? ' · ' : ''}🏠 ${indoor.error || 'room sensor…'}`;
+  }
+}
 async function fetchWeather() {
   if (DEMO) { // demo sky: partly cloudy 9°C
     window._wTemp = 9.5;
@@ -548,43 +587,32 @@ async function fetchWeather() {
     $('wText').textContent = 'partly cloudy (demo)'; $('wPc').textContent = '· demo';
     return;
   }
+  if (wsLive()) return;
   try {
-    const w = await (await fetch('/api/weather', {headers: H()})).json();
-    if (w.ok) {
-      window._wTemp = w.temp;
-      $('wEmoji').textContent = w.emoji; $('wTemp').textContent = w.temp + '°C';
-      $('wText').textContent = w.text; $('wPc').textContent = `· ${w.postcode} ${w.place || ''}`;
-      if (window._lastMax != null) {
-        const d = (window._lastMax - w.temp).toFixed(1);
-        $('wDelta').textContent = `HDD max ${d >= 0 ? '+' : ''}${d}°C vs outside`;
-      }
-    } else { $('wEmoji').textContent = '⚪'; $('wText').textContent = w.error || 'off'; }
-    const indoor = w.indoor;
-    if (indoor && indoor.ok) {
-      $('wDelta').textContent += `${$('wDelta').textContent ? ' · ' : ''}🏠 ${indoor.temp}°C${indoor.humidity != null ? ` 💧 ${indoor.humidity}%` : ''} (room${indoor.age_s != null ? `, ${indoor.age_s}s ago` : ''})`;
-    } else if (indoor && indoor.ok === false) {
-      $('wDelta').textContent += `${$('wDelta').textContent ? ' · ' : ''}🏠 ${indoor.error || 'room sensor…'}`;
-    }
+    renderWeather(await (await fetch('/api/weather', {headers: H()})).json());
   } catch (e) {}
 }
 
 /* ---------- plug tile: live watts + today/yesterday kWh ---------- */
+function renderPlug(p) {
+  $('pTopic').textContent = p.topic ? `· ${p.topic}` : '';
+  if (p.ok) {
+    $('pPower').textContent = p.power != null ? p.power + 'W' : '–';
+    const t = p.today_kwh != null ? `today ${p.today_kwh} kWh` : 'today …';
+    const y = p.yesterday_kwh != null ? `yesterday${p.yesterday_day ? ` (${p.yesterday_day.slice(5)})` : ''} ${p.yesterday_kwh} kWh` : 'yesterday …';
+    $('pToday').textContent = `${t} · ${y}`;
+    $('pNote').textContent = p.age_s != null ? `live · ${p.age_s}s ago${p.energy != null ? ` · meter ${p.energy} kWh` : ''}` : '';
+  } else { $('pPower').textContent = '⚪'; $('pToday').textContent = ''; $('pNote').textContent = p.error || 'off'; }
+}
 async function fetchPlug() {
   if (DEMO) {
     $('pPower').textContent = '42.5W'; $('pTopic').textContent = '· demo';
     $('pToday').textContent = 'today 0.31 kWh · yesterday 0.28 kWh'; $('pNote').textContent = '';
     return;
   }
+  if (wsLive()) return;
   try {
-    const p = await (await fetch('/api/plug', {headers: H()})).json();
-    $('pTopic').textContent = p.topic ? `· ${p.topic}` : '';
-    if (p.ok) {
-      $('pPower').textContent = p.power != null ? p.power + 'W' : '–';
-      const t = p.today_kwh != null ? `today ${p.today_kwh} kWh` : 'today …';
-      const y = p.yesterday_kwh != null ? `yesterday${p.yesterday_day ? ` (${p.yesterday_day.slice(5)})` : ''} ${p.yesterday_kwh} kWh` : 'yesterday …';
-      $('pToday').textContent = `${t} · ${y}`;
-      $('pNote').textContent = p.age_s != null ? `live · ${p.age_s}s ago${p.energy != null ? ` · meter ${p.energy} kWh` : ''}` : '';
-    } else { $('pPower').textContent = '⚪'; $('pToday').textContent = ''; $('pNote').textContent = p.error || 'off'; }
+    renderPlug(await (await fetch('/api/plug', {headers: H()})).json());
   } catch (e) {}
 }
 
@@ -604,6 +632,7 @@ async function chart() {
     drawChart(readings, events, series);
     return;
   }
+  if (wsLive()) return; // socket pushes chart frames; HTTP is fallback only
   try {
     const h = await (await fetch('/api/history?limit=300', {headers: H()})).json();
     readings = (h.readings || []).filter(p => p.max != null);
@@ -755,7 +784,7 @@ function simHost() {
       write_mbs: +(1 + heat * 22 + Math.random() * 2).toFixed(1)}};
 }
 async function fetchHost() {
-  if (!TOK) return;
+  if (!TOK || wsLive()) return;
   if (DEMO) { renderHost(simHost()); return; }
   try {
     const h = await (await fetch('/api/hostmetrics', {headers: H()})).json();
@@ -763,7 +792,7 @@ async function fetchHost() {
   } catch (e) {}
 }
 async function fetchNetlog() {
-  if (!TOK) return;
+  if (!TOK || wsLive()) return;
   if (DEMO) return;
   try {
     const n = await (await fetch('/api/netlog?lines=12', {headers: H()})).json();
@@ -782,9 +811,9 @@ $('ntfyTest').onclick = async () => {
   } catch (e) { $('ntfyTestRes').textContent = '❌ network error'; }
 };
 
-/* ---------- 1s fast lane (remote mode): fan + heartbeat in one RTT ---------- */
+/* ---------- 1s fast lane (remote mode, HTTP fallback only when socket down) ---------- */
 async function fastTick() {
-  if (!TOK || DEMO || whereMode !== 'remote') return;
+  if (!TOK || DEMO || whereMode !== 'remote' || wsLive()) return;
   try {
     const f = await (await fetch('/api/fast', {headers: H()})).json();
     if (f.fan) {
@@ -811,26 +840,29 @@ $('dlEv').onclick = () => dl('events');
 
 /* ---------- manual control: slider + presets ---------- */
 let mBounds = {min: 102, floor: 102, ceiling: 184, max_sec: 1800};
+function renderManual(m) {
+  if (!m) return;
+  mBounds = {min: m.min, floor: m.floor, ceiling: m.ceiling, max_sec: m.max_sec};
+  const sl = $('mSlider');
+  sl.min = m.min; sl.max = 255;
+  if (m.active) {
+    sl.value = m.pwm;
+    $('mVal').textContent = m.pct + '%';
+    $('mVal').className = 'big ' + (m.pct <= 45 ? 'st-normal' : m.pct < 90 ? 'st-boost' : 'st-critical');
+    $('mMode').className = 'pill warn';
+    $('mMode').textContent = '🎛️ MANUAL';
+    window._mUntil = m.until * 1000;
+  } else {
+    $('mMode').className = 'pill ok';
+    $('mMode').textContent = '🤖 AUTO';
+    window._mUntil = null;
+    $('mRemain').textContent = '';
+  }
+}
 async function fetchManual() {
-  if (!TOK) return;
+  if (!TOK || wsLive()) return;
   try {
-    const m = await (await fetch('/api/manual', {headers: H()})).json();
-    mBounds = {min: m.min, floor: m.floor, ceiling: m.ceiling, max_sec: m.max_sec};
-    const sl = $('mSlider');
-    sl.min = m.min; sl.max = 255;
-    if (m.active) {
-      sl.value = m.pwm;
-      $('mVal').textContent = m.pct + '%';
-      $('mVal').className = 'big ' + (m.pct <= 45 ? 'st-normal' : m.pct < 90 ? 'st-boost' : 'st-critical');
-      $('mMode').className = 'pill warn';
-      $('mMode').textContent = '🎛️ MANUAL';
-      window._mUntil = m.until * 1000;
-    } else {
-      $('mMode').className = 'pill ok';
-      $('mMode').textContent = '🤖 AUTO';
-      window._mUntil = null;
-      $('mRemain').textContent = '';
-    }
+    renderManual(await (await fetch('/api/manual', {headers: H()})).json());
   } catch (e) {}
 }
 async function postManual(body) {

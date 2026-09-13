@@ -20,9 +20,9 @@ writes the self-expiring `override.json` for manual control.
 
 | File | What it is |
 |---|---|
-| `app.py` | FastAPI backend: auth, live status APIs, SSE stream, config/manual/weather/metrics/export endpoints, local↔remote file layer |
+| `app.py` | FastAPI backend: auth, live status APIs, websocket feed, config/manual/weather/metrics/export endpoints, local↔remote file layer |
 | `index.html` | Single-page neon UI (no build step, no CDN required except fonts): flow map, RGB fan, charts, gauges, editors |
-| `Dockerfile` | `python:3.12-slim` + `fastapi uvicorn pyyaml requests paramiko paho-mqtt websocket-client`, serves on `6767` |
+| `Dockerfile` | `python:3.12-slim` + `fastapi uvicorn pyyaml requests paramiko paho-mqtt websocket-client websockets`, serves on `6767` |
 | `README.md` | This file |
 
 ## How to run
@@ -59,7 +59,7 @@ PROXMOX_HOST=192.168.1.2 PROXMOX_USER=root docker compose up -d --build admin
 ### D. Native on another VM/host, no Docker (remote mode)
 
 ```bash
-apt install python3-fastapi python3-uvicorn   # + pip install paramiko
+apt install python3-fastapi python3-uvicorn   # + pip install paramiko websockets
 PROXMOX_HOST=192.168.1.2 PROXMOX_USER=root PROXMOX_CONFIG=/opt/smart-nas-fan/config.yaml \
   python3 -m uvicorn app:app --host 0.0.0.0 --port 6767 --app-dir ./admin
 ```
@@ -97,7 +97,8 @@ auto-expire, `min_pwm` stall floor).
 |---|---|
 | `POST /api/login` `{user, pass}` | → `{token}` |
 | `GET /api/status` | Everything: temps, fan, heartbeat, MQTT, ntfy, DB, boost timer, `where` |
-| `GET /stream?token=` | SSE push of status every 2s (UI uses this; polling fallback built in) |
+| `GET /ws?token=` | **Live socket (primary): pushes status 2s, manual 10s, host/plug/logs/netlog 12–15s, chart 30s, weather 60s. HTTP polling below is fallback only** |
+| `GET /stream?token=` | Legacy SSE status push (kept as second fallback) |
 | `GET /api/fast` | Sub-second lane: fan + heartbeat in one roundtrip (UI polls 1s in remote mode) |
 | `GET /api/history?limit=` / `GET /api/drives?limit=` | Chart data: aggregate + per-drive series |
 | `GET /api/config` / `POST /api/config` | Read (form renders env-expanded values, passwords masked) / save config (`{content}` raw or `{values}` dotted-keys form, asks confirm, `.bak` kept) |
@@ -113,20 +114,20 @@ auto-expire, `min_pwm` stall floor).
 
 ## Data freshness (remote mode, honest numbers)
 
-Persistent SSH (one handshake, auto-reconnect) · fan fast lane ~1 RTT polled 1s ·
-full status ~2s over SSE · history DB re-pulled ≤ every 30s · TrueNAS temps ~5 min
-(by TrueNAS design) · NAS CPU/RAM/array-I/O live ~2s via the persistent WS
-`reporting.realtime` subscription (WS `get_data` + legacy REST only as failsafes;
-the card note shows `nas via <source>` or the chained error) · ms clock /
-boosted-since / down-since timers tick client-side at 97ms on any transport
-(countdown labels render whole seconds so they don't flicker).
+Persistent SSH (one handshake, auto-reconnect) · one GUI websocket pushing all
+feeds (status 2s … weather 60s; HTTP polling only when the socket is down) ·
+TrueNAS temps ~5 min (by TrueNAS design) · NAS CPU/RAM/array-I/O live ~2s via
+the persistent WS `reporting.realtime` subscription (WS `get_data` + legacy
+REST only as failsafes; the card note shows `nas via <source>` or the chained
+error) · ms clock / boosted-since / down-since timers tick client-side at 97ms
+on any transport (countdown labels render whole seconds so they don't flicker).
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
 | `📍 remote` but fan shows `proxmox ssh: …` | Key not trusted: `ssh-copy-id`, check `PROXMOX_USER/PORT/KEY`, SSH port reachable |
-| `No module named 'paramiko'` | Native remote needs it: `pip install paramiko` (Docker image already has it) |
+| `No module named 'paramiko'` / `'websockets'` | Native remote needs them: `pip install paramiko websockets` (Docker image already has them) |
 | Login loops / 401s | Wrong password, or token expired (12h TTL — just log in again) |
 | Edits don't affect fans | Editor saves the file — restart the **controller** (`docker compose restart controller`) |
 | NAS gauges / array I/O empty | Card note shows the chain (`nas via realtime` vs `realtime: … \| ws: … \| rest: …`); API key needs `REPORTING_READ`; restart admin after key/config changes (hub + z2m threads bind at startup) |
@@ -139,8 +140,8 @@ prefer `TRUENAS_API_KEY` env over writing the key into the config file.
 Threat model (public repo, homelab use): API keys/passwords live ONLY in `.env` /
 `smart-nas-fan.env` (both gitignored — verified, no `.env` or key files are tracked, and the
 full git history was scanned). Debug logs mask secrets (`***lenN`). Bearer tokens are
-32-hex random, `compare_digest`-checked, and **expire after 12h** (SSE `?token=` URLs
-land in access logs — expiry bounds that leak). UI escapes all dynamic strings.
+32-hex random, `compare_digest`-checked, and **expire after 12h** (`/ws?token=` and
+SSE `?token=` URLs land in access logs — expiry bounds that leak). UI escapes all dynamic strings.
 Treat any authenticated UI session as root-equivalent (config write + fan override),
 so guard `ADMIN_PASS` like one. SSH to Proxmox uses key auth + `AutoAddPolicy`
 (TLS-grade inside your LAN; use `verify_ssl: true` with a real cert if you have one).

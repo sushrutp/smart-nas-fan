@@ -1,7 +1,7 @@
 # smart-nas-fan / admin Dockerfile — neon control center on :6767
 FROM python:3.12-slim
 WORKDIR /app
-RUN pip install --no-cache-dir fastapi==0.115.* uvicorn==0.30.* pyyaml requests paramiko>=3.0 paho-mqtt>=1.6 websocket-client>=1.7
+RUN pip install --no-cache-dir fastapi==0.115.* uvicorn==0.30.* pyyaml requests paramiko>=3.0 paho-mqtt>=1.6 websocket-client>=1.7 websockets>=13
 COPY app.py index.html ./
 ENV NASTEMP_CONFIG=/config/config.yaml PYTHONUNBUFFERED=1
 EXPOSE 6767

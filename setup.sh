@@ -236,15 +236,15 @@ if [ "$SKIP_DEPS" = "0" ]; then
         run "Upgrading pip inside the venv" "$VENV/bin/pip" install -q --upgrade pip
         run "Installing controller deps from requirements.txt" \
             "$VENV/bin/pip" install -q -r "$SRC_DIR/requirements.txt"
-        run "Installing admin UI deps (fastapi, uvicorn) + paramiko" \
-            "$VENV/bin/pip" install -q "fastapi>=0.115" "uvicorn>=0.30" paramiko
+        run "Installing admin UI deps (fastapi, uvicorn, websockets) + paramiko" \
+            "$VENV/bin/pip" install -q "fastapi>=0.115" "uvicorn>=0.30" "websockets>=13" paramiko
     else
         printf 'WARN: venv pip missing, falling back to system pip\n'
         PY="/usr/bin/python3"
         run "Installing controller deps with system pip" \
             pip3 install --break-system-packages -r "$SRC_DIR/requirements.txt"
         run "Installing admin UI deps with system pip" \
-            pip3 install --break-system-packages "fastapi>=0.115" "uvicorn>=0.30" paramiko
+            pip3 install --break-system-packages "fastapi>=0.115" "uvicorn>=0.30" "websockets>=13" paramiko
     fi
 else
     say "Skipping venv + pip installs (--skip-deps was given)"

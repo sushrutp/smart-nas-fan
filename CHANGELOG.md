@@ -6,6 +6,13 @@ Releases go straight to `main`.
 
 ## [Unreleased]
 ### Changed
+- GUI↔backend is one websocket now: `GET /ws?token=` pushes status (2s),
+  manual (10s), host/plug/logs/netlog (12–15s), chart (30s), weather (60s)
+  with an instant burst on connect. The old per-endpoint HTTP timers and SSE
+  remain purely as fallback (they self-skip while the socket is live), so the
+  dashboard costs ~1 connection instead of ~10 requests/15s.
+- Needs the `websockets` package (admin Dockerfile, `setup.sh`, remote-mode
+  pip line); without it the socket fails and HTTP fallback keeps working.
 - NAS temps + metrics report which transport served them (`api(ws)` /
   `api(rest)` pill); temps failures chain the WS cause into the error.
 - Weather geocoding moved to Nominatim/OSM (proper postcode support, e.g.

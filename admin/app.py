@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 
 import requests
 import yaml
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -1682,9 +1682,7 @@ def export(kind: str = "readings", limit: int = 2000, _: bool = Depends(check_au
                     headers={"Content-Disposition": f"attachment; filename=smart-nas-fan-{kind}.csv"})
 
 
-@app.get("/api/logs")
-def logs(lines: int = 120, _: bool = Depends(check_auth)):
-    cfg = load_cfg()
+def _logs_tail(cfg, lines=40):
     if is_remote():
         try:
             tail = prox_exec(f"tail -n {min(lines, 500)} " + shlex.quote(cfg["timing"]["log_file"])).splitlines(keepends=True)
@@ -1699,11 +1697,86 @@ def logs(lines: int = 120, _: bool = Depends(check_auth)):
         return {"ok": False, "error": str(e)[:160], "lines": []}
 
 
+@app.get("/api/logs")
+def logs(lines: int = 120, _: bool = Depends(check_auth)):
+    return _logs_tail(load_cfg(), lines)
+
+
 @app.get("/api/netlog")
 def netlog(lines: int = 40, _: bool = Depends(check_auth)):
     """Connection-event log: websocket vs REST, MQTT and sensor failures with reasons."""
     with _netlog_lock:
         return {"ok": True, "lines": list(_netlog)[-min(max(lines, 1), 60):]}
+
+
+_WS_CADENCE = (("status", 2), ("manual", 10), ("host", 15), ("plug", 15),
+               ("logs", 12), ("netlog", 15), ("chart", 30), ("weather", 60))
+
+
+def _ws_payload(cfg, kind):
+    """Build one push frame payload. Blocking calls run in threads via to_thread."""
+    if kind == "status":
+        return build_status()
+    if kind == "manual":
+        return manual_state(cfg)
+    if kind == "host":
+        return {"proxmox": proxmox_host(), "truenas": truenas_metrics(cfg)}
+    if kind == "plug":
+        return plug_sensor(cfg)
+    if kind == "logs":
+        return _logs_tail(cfg, 40)
+    if kind == "netlog":
+        with _netlog_lock:
+            return {"ok": True, "lines": list(_netlog)[-12:]}
+    if kind == "chart":
+        db = cfg["timing"].get("db_file", "/var/log/smart-nas-fan.db")
+        h = db_last(db, 300)
+        return {"readings": h.get("readings", []), "events": h.get("events", []),
+                "series": drives(limit=300).get("series", {})}
+    if kind == "weather":
+        out = outside_weather(cfg)
+        out["indoor"] = indoor_sensor(cfg)
+        return out
+    raise RuntimeError(f"unknown feed {kind}")
+
+
+@app.websocket("/ws")
+async def ws_feed(ws: WebSocket):
+    """Single live socket GUI<->backend: pushes status/manual/host/plug/chart/
+    weather/logs/netlog on cadence (initial burst on connect, then only due
+    feeds). Auth via ?token= (same bearer as HTTP). Plain HTTP polling remains
+    as fallback when the socket is down. Needs the `websockets` package."""
+    if not _valid_token(ws.query_params.get("token", "")):
+        await ws.close(code=4401)
+        return
+    await ws.accept()
+    cfg, cfg_ts = load_cfg(), time.time()
+    last = {k: 0.0 for k, _ in _WS_CADENCE}
+    try:
+        while True:
+            now = time.time()
+            if now - cfg_ts > 60:  # pick up config saves without reconnecting
+                cfg, cfg_ts = load_cfg(), now
+            for kind, every in _WS_CADENCE:
+                if now - last[kind] < every:
+                    continue
+                last[kind] = now
+                try:
+                    data = await asyncio.to_thread(_ws_payload, cfg, kind)
+                    await ws.send_json({"type": kind, "data": data})
+                except Exception as e:
+                    debug(f"ws feed {kind} skipped: {e}")
+                    last[kind] = now - every + 5  # retry this feed in 5s, keep others
+            try:
+                msg = await asyncio.wait_for(ws.receive_json(), timeout=1.0)
+                if isinstance(msg, dict) and "ping" in msg:
+                    await ws.send_json({"type": "pong", "data": msg["ping"]})
+            except asyncio.TimeoutError:
+                pass
+    except (WebSocketDisconnect, RuntimeError, ConnectionError):
+        pass
+    except Exception as e:
+        debug(f"ws feed closed: {e}")
 
 
 if __name__ == "__main__":
