@@ -309,6 +309,8 @@ class PwmHw:
 def _api_key(cfg):
     return os.environ.get("TRUENAS_API_KEY") or cfg["truenas"].get("api_key") or ""
 
+_transport_state = {"ws_ok": True}  # flip-flop guard: log WS<->REST transitions once
+
 def _truenas_ws_url(cfg):
     """Derive JSON-RPC WebSocket URL from api_url/host.
 
@@ -489,15 +491,26 @@ def api_post(cfg, method, params=None):
 
     cfg['truenas']['api_transport']: 'auto' (default: WS then REST) |
     'ws'/'websocket' (WS only) | 'rest' (legacy REST only).
+    Fallback transitions are logged to console (not just debug) so you can see
+    whether the box is really on websocket or silently on deprecated REST.
     """
     transport = str(cfg["truenas"].get("api_transport", "auto") or "auto").lower()
     if transport in ("ws", "websocket", "auto"):
         try:
-            return ws_api_post(cfg, method, params)
+            res = ws_api_post(cfg, method, params)
+            if not _transport_state["ws_ok"]:
+                _transport_state["ws_ok"] = True
+                log_line(cfg, f"TrueNAS websocket recovered ({method} OK) — off REST fallback")
+            return res
         except Exception as e:
             if transport != "auto":
                 raise
-            debug(cfg, f"WS {method} failed ({e}), falling back to REST")
+            if _transport_state["ws_ok"]:
+                _transport_state["ws_ok"] = False
+                log_line(cfg, f"TrueNAS websocket FAILED ({e}) — using legacy REST fallback "
+                              f"for {method} (deprecated, alerts on TrueNAS)")
+            else:
+                debug(cfg, f"WS {method} failed ({e}), staying on REST fallback")
             return rest_api_post(cfg, method, params)
     return rest_api_post(cfg, method, params)
 

@@ -106,8 +106,10 @@ auto-expire, `min_pwm` stall floor).
 | `GET /api/hostmetrics` | Proxmox CPU/RAM + TrueNAS CPU/RAM + array MB/s (live `realtime` WS feed; `source` field says `realtime`/`ws`/`rest`) |
 | `POST /api/ntfy-test` | Send Test Alert push |
 | `GET /api/export?kind=readings\|events` | CSV download (opens in Excel) |
-| `GET /api/weather` | Outside temp + condition emoji (Open-Meteo, cached 10 min) + `indoor` room temp/humidity from Zigbee2MQTT |
+| `GET /api/weather` | Outside temp + condition emoji (Nominatim geocode + Open-Meteo forecast, cached 10 min) + `indoor` room temp/humidity from Zigbee2MQTT |
+| `GET /api/plug` | Sonoff plug: live W, meter kWh, today/yesterday kWh |
 | `GET /api/logs?lines=` | Log tail |
+| `GET /api/netlog?lines=` | Connection-event log (websocket vs REST, MQTT — with reasons, no debug flag needed) |
 
 ## Data freshness (remote mode, honest numbers)
 
@@ -128,7 +130,7 @@ boosted-since / down-since timers tick client-side at 97ms on any transport
 | Login loops / 401s | Wrong password, or token expired (12h TTL — just log in again) |
 | Edits don't affect fans | Editor saves the file — restart the **controller** (`docker compose restart controller`) |
 | NAS gauges / array I/O empty | Card note shows the chain (`nas via realtime` vs `realtime: … \| ws: … \| rest: …`); API key needs `REPORTING_READ`; restart admin after key/config changes (hub + z2m threads bind at startup) |
-| Room sensor shows an error | `sensors.topic` must match the Zigbee2MQTT topic (default `zigbee2mqtt/<friendly-name>`); broker must be reachable from the admin host, user/pass optional |
+| Room sensor shows an error | `sensors.topic` must match the Zigbee2MQTT topic (default `zigbee2mqtt/<friendly-name>`); the error names the `broker:port` it failed on — from the admin host run `nc -zv <broker> 1883` (use the Pi's LAN IP, never `localhost`, unless admin runs on the Pi itself); restart admin after broker/topic changes |
 | Port in use | Another admin running: `ps aux \| grep uvicorn` / `docker ps` |
 
 Security: keep `:6767` LAN-only behind your firewall, set a strong `ADMIN_PASS`,

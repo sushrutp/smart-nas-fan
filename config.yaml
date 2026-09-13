@@ -71,3 +71,6 @@ sensors:
   topic: zigbee2mqtt/0xa4c1380ac08fffff
   temp_key: temperature
   humidity_key: humidity
+  plug_topic:
+  power_key: power
+  energy_key: energy

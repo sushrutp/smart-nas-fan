@@ -118,11 +118,13 @@ ntfy flash on new event, shared-axis chart (🌡️ temp + 🌀 fan% + 🔔 ntfy
 - Header has **● live / ▶ demo switch** + clock with **milliseconds** — demo simulates
   3 HDDs with heat waves **plus random system faults** (🔥 banner, red lines) so you can
   see the whole show with no hardware.
-- **🌍 outside weather** (Open-Meteo, free, no key): set `weather.postcode` (default
-  `33333`) + `weather.country`, or `weather.latitude`/`weather.longitude` to skip
-  the lookup entirely. Compare HDD max Δ vs outside with condition emoji
+- **🌍 outside weather** (Nominatim geocode + Open-Meteo forecast, free, no key):
+  set `weather.postcode` + `weather.country`, or `weather.latitude`/`weather.longitude`
+  to skip the lookup entirely. Compare HDD max Δ vs outside with condition emoji
   (☀️🌧️❄️⛈️🌫️…). The same tile shows the **🏠 room sensor** (Zigbee2MQTT
   temp/humidity via `sensors.topic`, e.g. `zigbee2mqtt/<friendly-name>`).
+- **🔌 plug tile** (Sonoff etc.): live watts + meter total + today/yesterday kWh
+  from `sensors.plug_topic` (`power`/`energy` keys, day baselines persisted).
 - Live data pushes over **SSE `/stream`** (auto-reconnect, polling fallback); flow lines are
   **green = flowing, blue = idle, red glow = broken**, with **⚡ ping ms** on the
   TrueNAS + MQTT arrows.

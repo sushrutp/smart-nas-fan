@@ -5,6 +5,23 @@ The `VERSION` file + admin UI header badge always show the current release.
 Releases go straight to `main`.
 
 ## [Unreleased]
+### Changed
+- NAS temps + metrics report which transport served them (`api(ws)` /
+  `api(rest)` pill); temps failures chain the WS cause into the error.
+- Weather geocoding moved to Nominatim/OSM (proper postcode support, e.g.
+  `85276` Germany) with free-text retry; forecast stays Open-Meteo.
+  `weather.latitude`/`longitude` still skips lookup entirely.
+- Room/plug MQTT errors now carry `broker:port` plus the `nc -zv` check to run.
+- Shared MQTT subscriber covers the room topic and the plug topic.
+### Added
+- 🔌 plug tile: live watts, meter total, today + yesterday kWh
+  (`sensors.plug_topic/power_key/energy_key`), day baselines persisted to
+  `<rundir>/z2m_plug.json`, `GET /api/plug`.
+- Always-on connection log: admin prints `net[...] websocket/MQTT` lines on
+  every transport transition (no `ADMIN_DEBUG` needed), kept in a ring buffer
+  at `GET /api/netlog` and shown under 📜 logs; controller logs WS→REST
+  fallback/recovery to console the same way (transition-only, no spam).
+  GUI pill shows `api(ws)` / `api(rest)` so REST usage can't hide.
 
 ## [1.13] – 2026-09-13
 ### Changed

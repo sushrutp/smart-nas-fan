@@ -58,6 +58,34 @@ def _mask(v):
     s = str(v or "")
     return "(empty)" if not s else f"***len{len(s)}"
 
+_netlog: list = []          # ring buffer: last ~60 connection events (console + GUI)
+_link_state: dict = {}      # subsystem -> "up"/"down" (transition-only logging)
+
+
+def note(sub, msg):
+    """Always-on console line for connection events (WS/MQTT fallbacks, reconnects).
+
+    Unlike debug() this prints WITHOUT needing ADMIN_DEBUG, and is kept in a
+    ring buffer served at GET /api/netlog so the GUI shows it too."""
+    line = (f"{datetime.now(timezone.utc).astimezone().isoformat(timespec='seconds')} "
+            f"net[{sub}] {msg}")
+    print(line, flush=True)
+    with _netlog_lock:
+        _netlog.append(line)
+        del _netlog[:-60]
+
+
+def mark(sub, ok, msg_ok="", msg_fail=""):
+    """Log a subsystem transition once (no per-retry spam during long outages).
+
+    Returns the new state ("up"/"down"). First call for a subsystem always logs,
+    so a healthy boot still proves in the console which transport is live."""
+    cur = "up" if ok else "down"
+    if _link_state.get(sub) != cur:
+        _link_state[sub] = cur
+        note(sub, (msg_ok or "up") if ok else (msg_fail or "down"))
+    return cur
+
 _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
 def _expand_env(obj):
@@ -130,6 +158,8 @@ def _ssh_client():
 
 
 import threading as _th
+
+_netlog_lock = _th.Lock()
 
 _ssh_lock = _th.Lock()
 _ssh_pooled = None
@@ -388,7 +418,7 @@ def _tn_ws_query_then_temps(cfg, timeout=10):
             pass
 
 
-def _tn_temps_from_results(cfg, disks, raw, t0):
+def _tn_temps_from_results(cfg, disks, raw, t0, transport="ws"):
     """Build truenas_api() result dict from disk.query + disk.temperatures payloads."""
     t = cfg.get("truenas", {})
     names = []
@@ -415,8 +445,12 @@ def _tn_temps_from_results(cfg, disks, raw, t0):
     if not temps:
         return {"ok": False, "error": "no temps returned", "latency_ms": ms}
     vals = list(temps.values())
-    debug(f"TrueNAS temps ok (ws): {len(vals)} HDDs max={max(vals)} in {ms}ms")
-    return {"ok": True, "source": "api", "max": max(vals), "avg": round(sum(vals) / len(vals), 1),
+    if transport == "ws":
+        mark("tn:temps", True, "temps via websocket (JSON-RPC)")
+    else:
+        mark("tn:temps", False, "", "temps via REST fallback — websocket failed, see net log")
+    debug(f"TrueNAS temps ok ({transport}): {len(vals)} HDDs max={max(vals)} in {ms}ms")
+    return {"ok": True, "source": "api", "transport": transport, "max": max(vals), "avg": round(sum(vals) / len(vals), 1),
             "count": len(vals), "temps": temps, "latency_ms": ms}
 
 
@@ -437,14 +471,16 @@ def truenas_api(cfg):
     debug(f"TrueNAS temps via {_tn_ws_url(cfg) if _tn_transport(cfg) != 'rest' else base} "
           f"key={_mask(key)} hdd_only={t.get('hdd_only', True)} transport={_tn_transport(cfg)}")
     try:
+        ws_err = None
         if _tn_transport(cfg) in ("ws", "websocket", "auto"):
             try:
                 disks, raw = _tn_ws_query_then_temps(cfg, to)
-                return _tn_temps_from_results(cfg, disks, raw, t0)
+                return _tn_temps_from_results(cfg, disks, raw, t0, transport="ws")
             except Exception as e:
+                ws_err = str(e)[:140]
                 if _tn_transport(cfg) != "auto":
                     raise
-                debug(f"WS failed ({e}), falling back to REST")
+                debug(f"WS failed ({ws_err}), falling back to REST")
         q = requests.post(f"{base}/api/v2.0/disk.query", json=[],
                           headers=hdr, timeout=to, verify=verify)
         q.raise_for_status()
@@ -475,14 +511,17 @@ def truenas_api(cfg):
                 temps[f"/dev/{n}"] = round(tv, 1)
         ms = int((time.time() - t0) * 1000)
         if not temps:
-            return {"ok": False, "error": "no temps returned", "latency_ms": ms}
+            err = "no temps returned" + (f" (ws also failed: {ws_err})" if ws_err else "")
+            return {"ok": False, "error": err[:200], "latency_ms": ms}
         vals = list(temps.values())
-        debug(f"TrueNAS temps ok: {len(vals)} HDDs max={max(vals)} in {ms}ms")
-        return {"ok": True, "source": "api", "max": max(vals), "avg": round(sum(vals) / len(vals), 1),
+        debug(f"TrueNAS temps ok (rest): {len(vals)} HDDs max={max(vals)} in {ms}ms")
+        return {"ok": True, "source": "api", "transport": "rest", "max": max(vals), "avg": round(sum(vals) / len(vals), 1),
                 "count": len(vals), "temps": temps, "latency_ms": ms}
     except Exception as e:
         debug(f"TrueNAS temps FAIL: {e}")
-        return {"ok": False, "error": str(e)[:160], "latency_ms": int((time.time() - t0) * 1000)}
+        mark("tn:temps", False, "", f"temps FAILED — ws: {ws_err or 'n/a'} / rest: {e}")
+        err = str(e)[:160] + (f" (ws also failed: {ws_err})" if ws_err else "")
+        return {"ok": False, "error": err[:220], "latency_ms": int((time.time() - t0) * 1000)}
 
 
 def fan_hw(cfg=None):
@@ -623,7 +662,8 @@ _weather_cache: dict = {}
 
 
 def outside_weather(cfg):
-    """Ambient outside temp via Open-Meteo (free, no key). Cached 10 min."""
+    """Ambient outside temp. Geocode via Nominatim/OSM (proper postcode support),
+    forecast via Open-Meteo (free, no key). Cached 10 min."""
     w = cfg.get("weather", {})
     if not w.get("enabled", True):
         return {"ok": None, "error": "disabled"}
@@ -632,34 +672,39 @@ def outside_weather(cfg):
         debug("weather: cache hit")
         return _weather_cache["data"]
     try:
-        pc, country = w.get("postcode", "33333"), w.get("country", "United States")
+        pc, country = str(w.get("postcode", "33333")), w.get("country", "United States")
         lat, lon = w.get("latitude"), w.get("longitude")
         if lat is not None and lon is not None:
             # exact coordinates configured: skip geocoding entirely
             debug(f"weather: using configured lat={lat} lon={lon}")
             place = {"latitude": float(lat), "longitude": float(lon), "name": w.get("place") or pc}
         else:
-            debug(f"weather: geocode postcode={pc} country={country}")
-            g = requests.get("https://geocoding-api.open-meteo.com/v1/search",
-                             params={"name": pc, "count": 8, "language": "en", "format": "json"},
-                             timeout=8).json()
-            results = g.get("results") or []
-            want = str(country or "").strip().lower()
-            place = None
-            for r in results:
-                rc = str(r.get("country") or "").lower()
-                # two-way match: "United States" vs "United States of America",
-                # plus ISO code match (r.country_code e.g. "IN")
-                if want and (want in rc or rc in want or
-                             want == str(r.get("country_code") or "").lower()):
-                    place = r
-                    break
-            if not place and len(results) == 1:
-                place = results[0]  # unambiguous single hit: take it
-            if not place:
-                top = results[0] if results else {}
+            debug(f"weather: nominatim geocode postcode={pc} country={country}")
+            g = requests.get("https://nominatim.openstreetmap.org/search",
+                             params={"postalcode": pc.strip(), "country": (country or "").strip(),
+                                     "format": "jsonv2", "addressdetails": 0, "limit": 5},
+                             headers={"User-Agent": "smart-nas-fan/1.0 (homelab weather tile)",
+                                      "Accept": "application/json"},
+                             timeout=10)
+            g.raise_for_status()
+            results = g.json() or []
+            if not results and pc.strip().isdigit():
+                # some regions index better as free-text query
+                debug("weather: postalcode search empty, retrying as q=")
+                g = requests.get("https://nominatim.openstreetmap.org/search",
+                                 params={"q": f"{pc.strip()}, {(country or '').strip()}",
+                                         "format": "jsonv2", "addressdetails": 0, "limit": 5},
+                                 headers={"User-Agent": "smart-nas-fan/1.0 (homelab weather tile)",
+                                          "Accept": "application/json"},
+                                 timeout=10)
+                g.raise_for_status()
+                results = g.json() or []
+            if not results:
                 return {"ok": False, "error": f"postcode {pc} not found in {country} "
-                        f"(top hit: {top.get('name', '?')}, {top.get('country', '?')}) — fix weather.postcode/country or set weather.latitude/longitude"}
+                        f"— set weather.latitude/longitude (e.g. from openstreetmap.org search)"}
+            top = results[0]
+            place = {"latitude": float(top["lat"]), "longitude": float(top["lon"]),
+                     "name": top.get("display_name", pc).split(",")[0]}  # short place name
         f = requests.get("https://api.open-meteo.com/v1/forecast",
                          params={"latitude": place["latitude"], "longitude": place["longitude"],
                                  "current": "temperature_2m,weather_code", "timezone": "auto"},
@@ -677,81 +722,188 @@ def outside_weather(cfg):
 
 
 _z2m_cache: dict = {"ts": 0, "temp": None, "humidity": None, "error": "subscriber not started"}
-_z2m_started = False
+_plug_cache: dict = {"ts": 0, "power": None, "energy": None, "today_kwh": None,
+                     "yesterday_kwh": None, "yesterday_day": None, "error": "subscriber not started"}
+_plug_day: dict = {"day": None, "start": None, "last": None,
+                   "yesterday": None, "yesterday_day": None, "saved_ts": 0}
+_mqtt_started = False
 _z2m_lock = _th.Lock()
 
 
-def _z2m_ensure(cfg):
-    """Start the Zigbee2MQTT subscriber thread once (daemon, auto-reconnect).
+def _mqtt_broker_cfg(cfg):
+    m = cfg.get("mqtt", {})
+    return ((m.get("broker") or "").strip(), int(m.get("port", 1883)),
+            str(m.get("username") or "").strip(), str(m.get("password") or ""))
 
-    Reuses the mqtt broker + credentials (anonymous when username is empty).
-    Never raises: failures land in _z2m_cache["error"] for the UI to show."""
-    global _z2m_started
-    if _z2m_started:
+
+def _plug_state_path(cfg):
+    try:
+        hb = cfg["timing"]["heartbeat_file"]
+        return os.path.join(os.path.dirname(hb), "z2m_plug.json")
+    except Exception:
+        return None
+
+
+def _plug_state_load(cfg):
+    p = _plug_state_path(cfg)
+    if not p:
         return
-    _z2m_started = True
+    try:
+        with open(p) as f:
+            d = json.load(f)
+        for k in ("day", "start", "last", "yesterday", "yesterday_day"):
+            if k in d:
+                _plug_day[k] = d[k]
+        debug(f"plug day-state loaded from {p}: {_plug_day}")
+    except Exception:
+        pass
+
+
+def _plug_state_save(cfg):
+    p = _plug_state_path(cfg)
+    if not p:
+        return
+    try:
+        d = os.path.dirname(p)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(p, "w") as f:
+            json.dump({k: _plug_day.get(k) for k in
+                       ("day", "start", "last", "yesterday", "yesterday_day")}, f)
+        _plug_day["saved_ts"] = time.time()
+    except Exception as e:
+        debug(f"plug day-state save failed: {e}")
+
+
+def _plug_accounting(cfg, energy, now_ts):
+    """Daily kWh from cumulative energy: today = energy - midnight baseline,
+    yesterday = last-of-yesterday - its baseline. Survives restarts via JSON."""
+    if not isinstance(energy, (int, float)):
+        return
+    energy = float(energy)
+    day = datetime.fromtimestamp(now_ts).astimezone().strftime("%Y-%m-%d")
+    d = _plug_day
+    if d["day"] != day:
+        if d["day"] is not None and d["start"] is not None and d["last"] is not None:
+            d["yesterday"] = round(max(0.0, d["last"] - d["start"]), 3)
+            d["yesterday_day"] = d["day"]
+        d["day"], d["start"] = day, energy  # re-baseline at first reading of the day
+        _plug_state_save(cfg)
+    d["last"] = energy
+    if d["start"] is not None:
+        _plug_cache["today_kwh"] = round(max(0.0, energy - d["start"]), 3)
+    _plug_cache["yesterday_kwh"] = d["yesterday"]
+    _plug_cache["yesterday_day"] = d["yesterday_day"]
+    if time.time() - d.get("saved_ts", 0) > 300:
+        _plug_state_save(cfg)
+
+
+def _mqtt_ensure(cfg):
+    """Start the shared MQTT subscriber thread once (daemon, auto-reconnect).
+
+    Subscribes to the room-sensor topic AND the plug topic. Reuses the mqtt
+    broker + credentials (anonymous when username is empty). Never raises:
+    failures land in the caches with broker:port attached for the UI to show.
+    """
+    global _mqtt_started
+    if _mqtt_started:
+        return
+    _mqtt_started = True
     s = cfg.get("sensors", {})
     if not s.get("enabled", True):
-        _z2m_cache["error"] = "disabled"
+        _z2m_cache["error"] = _plug_cache["error"] = "disabled"
         return
-    topic = str(s.get("topic") or "").strip()
-    if not topic:
-        _z2m_cache["error"] = "set sensors.topic (e.g. zigbee2mqtt/<friendly-name>)"
+    topics = [t for t in [str(s.get("topic") or "").strip(),
+                          str(s.get("plug_topic") or "").strip()] if t]
+    if not topics:
+        _z2m_cache["error"] = _plug_cache["error"] = \
+            "set sensors.topic (e.g. zigbee2mqtt/<friendly-name>)"
         return
     try:
         import paho.mqtt.client as pm
     except ImportError:
-        _z2m_cache["error"] = "paho-mqtt not installed"
+        _z2m_cache["error"] = _plug_cache["error"] = "paho-mqtt not installed"
         return
-    m = cfg.get("mqtt", {})
-    args = ((m.get("broker") or "").strip(), int(m.get("port", 1883)),
-            str(m.get("username") or "").strip(), str(m.get("password") or ""),
-            topic, str(s.get("temp_key") or "temperature"),
-            str(s.get("humidity_key") or "humidity"))
-    if not args[0]:
-        _z2m_cache["error"] = "mqtt.broker not set"
+    broker, port, user, passwd = _mqtt_broker_cfg(cfg)
+    if not broker:
+        _z2m_cache["error"] = _plug_cache["error"] = "mqtt.broker not set"
         return
-    t = _th.Thread(target=_z2m_loop, args=(pm,) + args, daemon=True)
+    _plug_state_load(cfg)
+    t = _th.Thread(target=_mqtt_loop, args=(cfg, pm, broker, port, user, passwd), daemon=True)
     t.start()
 
 
-def _z2m_loop(pm, broker, port, user, passwd, topic, tkey, hkey):
-    """Blocking subscriber: caches the latest temp/humidity payload."""
+def _mqtt_loop(cfg, pm, broker, port, user, passwd):
+    """Blocking subscriber: caches room temp/humidity + plug power/energy."""
+    s = cfg.get("sensors", {})
+    topic = str(s.get("topic") or "").strip()
+    plug_topic = str(s.get("plug_topic") or "").strip()
+    tkey, hkey = str(s.get("temp_key") or "temperature"), str(s.get("humidity_key") or "humidity")
+    pkey, ekey = str(s.get("power_key") or "power"), str(s.get("energy_key") or "energy")
+
     def on_msg(_c, _u, msg):
         try:
             p = json.loads(msg.payload.decode())
+        except Exception as e:
+            debug(f"mqtt bad payload on {msg.topic}: {e}")
+            return
+        now = time.time()
+        if msg.topic == topic:
             t, h = p.get(tkey), p.get(hkey)
             with _z2m_lock:
                 if isinstance(t, (int, float)):
                     _z2m_cache["temp"] = round(float(t), 1)
                 if isinstance(h, (int, float)):
                     _z2m_cache["humidity"] = round(float(h), 1)
-                _z2m_cache["ts"] = time.time()
+                _z2m_cache["ts"] = now
                 _z2m_cache["error"] = None
-        except Exception as e:
+        elif msg.topic == plug_topic:
+            pw, en = p.get(pkey), p.get(ekey)
             with _z2m_lock:
-                _z2m_cache["error"] = f"bad payload: {e}"[:100]
+                if isinstance(pw, (int, float)):
+                    _plug_cache["power"] = round(float(pw), 1)
+                if isinstance(en, (int, float)):
+                    _plug_cache["energy"] = round(float(en), 3)
+                _plug_cache["ts"] = now
+                _plug_cache["error"] = None
+            _plug_accounting(cfg, en if isinstance(en, (int, float)) else None, now)
+
+    def where():
+        return f"MQTT {broker}:{port} (topics: {', '.join([t for t in [topic, plug_topic] if t]) or 'none'})"
+
     while True:  # loop_forever reconnects on drops; outer loop survives fatal errors
         try:
             try:
                 cbv = pm.CallbackAPIVersion.VERSION2
-                c = pm.Client(callback_api_version=cbv, client_id="smart-nas-fan-admin-z2m")
+                c = pm.Client(callback_api_version=cbv, client_id="smart-nas-fan-admin-mqtt")
             except (AttributeError, TypeError, ValueError):
-                c = pm.Client(client_id="smart-nas-fan-admin-z2m")
+                c = pm.Client(client_id="smart-nas-fan-admin-mqtt")
             if user:
                 c.username_pw_set(user, passwd)
             c.on_message = on_msg
+            debug(f"mqtt connect {broker}:{port} user={(user or '(anonymous)')}")
             c.connect(broker, port, 60)
-            c.subscribe(topic, qos=0)
+            for t in [topic, plug_topic]:
+                if t:
+                    c.subscribe(t, qos=0)
             with _z2m_lock:
-                _z2m_cache["error"] = None
-            debug(f"z2m subscribe {broker}:{port} topic={topic} user={(user or '(anonymous)')}")
+                _z2m_cache["error"] = _plug_cache["error"] = None
+            mark("mqtt:admin", True, f"MQTT {broker}:{port} connected ({', '.join([t for t in [topic, plug_topic] if t])})")
+            debug(f"mqtt subscribed: {where()}")
             c.loop_forever(retry_first_connection=True)
         except Exception as e:
+            err = (f"{where()} failed: {e} — is mqtt.broker reachable from this host? "
+                   f"try: nc -zv {broker} {port}")[:200]
             with _z2m_lock:
-                _z2m_cache["error"] = str(e)[:120]
-            debug(f"z2m loop failed ({e}), retry in 15s")
+                _z2m_cache["error"] = _plug_cache["error"] = err
+            mark("mqtt:admin", False, "", f"MQTT {broker}:{port} FAILED: {e}")
+            debug(f"mqtt loop failed ({e}), retry in 15s")
         time.sleep(15)
+
+
+# backward-compat alias: indoor_sensor() still boots the (now shared) subscriber
+def _z2m_ensure(cfg):
+    _mqtt_ensure(cfg)
 
 
 def indoor_sensor(cfg):
@@ -759,7 +911,7 @@ def indoor_sensor(cfg):
     s = cfg.get("sensors", {})
     if not s.get("enabled", True):
         return {"ok": None, "error": "disabled"}
-    _z2m_ensure(cfg)
+    _mqtt_ensure(cfg)
     with _z2m_lock:
         snap = dict(_z2m_cache)
     if snap.get("temp") is None:
@@ -767,6 +919,28 @@ def indoor_sensor(cfg):
                 "topic": str(s.get("topic") or "")}
     return {"ok": True, "temp": snap["temp"], "humidity": snap.get("humidity"),
             "age_s": int(time.time() - snap["ts"]), "topic": str(s.get("topic") or "")}
+
+
+def plug_sensor(cfg):
+    """Sonoff plug: live watts + cumulative energy + today/yesterday kWh."""
+    s = cfg.get("sensors", {})
+    if not s.get("enabled", True):
+        return {"ok": None, "error": "disabled"}
+    topic = str(s.get("plug_topic") or "").strip()
+    if not topic:
+        return {"ok": False, "error": "set sensors.plug_topic to the plug's zigbee2mqtt topic",
+                "topic": ""}
+    _mqtt_ensure(cfg)
+    with _z2m_lock:
+        snap = dict(_plug_cache)
+    if snap.get("power") is None and snap.get("energy") is None:
+        return {"ok": False, "error": snap.get("error") or "waiting for first MQTT message",
+                "topic": topic}
+    return {"ok": True, "power": snap.get("power"), "energy": snap.get("energy"),
+            "today_kwh": snap.get("today_kwh"), "yesterday_kwh": snap.get("yesterday_kwh"),
+            "yesterday_day": snap.get("yesterday_day"),
+            "age_s": int(time.time() - snap["ts"]) if snap.get("ts") else None,
+            "topic": topic}
 
 
 def build_status():
@@ -818,11 +992,15 @@ def _tn_req(cfg, method, params, timeout=12):
     if _tn_transport(cfg) in ("ws", "websocket", "auto"):
         try:
             res = _tn_ws_batch(cfg, [(method, params)], timeout=timeout)
+            mark(f"tn:{method}", True, f"{method} via websocket (JSON-RPC)")
             debug(f"TrueNAS {method} <- WS ok")
             return res[0]
         except Exception as e:
             if _tn_transport(cfg) != "auto":
+                mark(f"tn:{method}", False, "", f"{method} websocket FAILED: {e}")
                 raise
+            mark(f"tn:{method}", False, "",
+                 f"{method} websocket FAILED ({e}) — REST fallback (deprecated)")
             debug(f"TrueNAS {method} WS failed ({e}), REST fallback")
     t = cfg.get("truenas", {})
     key = os.environ.get("TRUENAS_API_KEY") or t.get("api_key") or ""
@@ -967,6 +1145,7 @@ def _tnhub_loop(cfg):
                 ws.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": "core.subscribe",
                                     "params": ["reporting.realtime"]}))
                 sub_id = _tn_ws_recv(ws, rid, 12)
+                mark("tn:hub", True, f"websocket connected + reporting.realtime subscribed ({sub_id})")
                 debug(f"tnhub subscribed reporting.realtime -> {sub_id}")
                 with _tnhub_lock:
                     _tnhub["error"] = None
@@ -1006,6 +1185,7 @@ def _tnhub_loop(cfg):
         except Exception as e:
             with _tnhub_lock:
                 _tnhub["error"] = str(e)[:140]
+            mark("tn:hub", False, "", f"websocket down: {e} — retrying")
             debug(f"tnhub loop failed ({e}), retry in 10s")
         time.sleep(10)
 
@@ -1019,6 +1199,7 @@ def truenas_realtime(cfg):
     f = snap.get("fields")
     if not isinstance(f, dict) or age > 15:
         err = snap.get("error") or "no realtime frame yet"
+        mark("tn:realtime", False, "", f"realtime feed down: {err}")
         return {"ok": False, "error": f"realtime: {err}"[:140]}
     try:
         res = {"ok": True, "source": "realtime", "age_s": int(age)}
@@ -1035,7 +1216,9 @@ def truenas_realtime(cfg):
         if isinstance(dk.get("write_bytes"), (int, float)):
             res["write_mbs"] = round(max(0, float(dk["write_bytes"])) / 1048576, 1)
         if len(res) <= 3:  # only ok/source/age_s -> nothing usable parsed
+            mark("tn:realtime", False, "", "realtime: unparseable frame")
             return {"ok": False, "error": "realtime: unparseable frame"}
+        mark("tn:realtime", True, "realtime feed live (websocket push, ~2s frames)")
         return res
     except Exception as e:
         return {"ok": False, "error": f"realtime parse: {e}"[:140]}
@@ -1160,6 +1343,7 @@ def truenas_metrics(cfg):
             [{"name": "cpu"}, {"name": "memory"}, {"name": "disk"}],
             {"unit": "HOUR", "page": 1, "aggregate": True}], timeout=15))
         res["source"] = "ws"
+        mark("tn:metrics", True, "metrics via websocket poll (get_data)")
         _metrics_cache.update(ts=now, data=res)
         return res
     except Exception as e:
@@ -1168,10 +1352,12 @@ def truenas_metrics(cfg):
     try:
         res = _tn_rest_reporting_legacy(cfg)
         res["source"] = "rest"
+        mark("tn:metrics", True, "metrics via REST fallback (deprecated)")
         _metrics_cache.update(ts=now, data=res)
         return res
     except Exception as e:
         errs.append(f"rest: {e}"[:140])
+    mark("tn:metrics", False, "", ("metrics FAILED: " + " | ".join(errs))[:180])
     return {"ok": False, "error": " | ".join(errs)[:220]}
 
 
@@ -1278,6 +1464,11 @@ def weather(_: bool = Depends(check_auth)):
     out = outside_weather(cfg)
     out["indoor"] = indoor_sensor(cfg)  # same tile: room sensor next to outside temp
     return out
+
+
+@app.get("/api/plug")
+def plug(_: bool = Depends(check_auth)):
+    return plug_sensor(load_cfg())
 
 
 @app.get("/api/history")
@@ -1506,6 +1697,13 @@ def logs(lines: int = 120, _: bool = Depends(check_auth)):
         return {"ok": True, "lines": tail}
     except Exception as e:
         return {"ok": False, "error": str(e)[:160], "lines": []}
+
+
+@app.get("/api/netlog")
+def netlog(lines: int = 40, _: bool = Depends(check_auth)):
+    """Connection-event log: websocket vs REST, MQTT and sensor failures with reasons."""
+    with _netlog_lock:
+        return {"ok": True, "lines": list(_netlog)[-min(max(lines, 1), 60):]}
 
 
 if __name__ == "__main__":
