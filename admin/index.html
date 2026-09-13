@@ -201,7 +201,7 @@ canvas{width:100%;height:260px;background:#060918f2;border:1px solid var(--line)
     </div>
     <div class="card" id="manualCard">
       <h2>🎛️ manual fan control</h2>
-      <div class="row"><span id="mMode" class="pill">🤖 AUTO</span><span id="mRemain" class="dim mono"></span></div>
+      <div class="row"><span id="mMode" class="pill">🤖 AUTO</span><span id="mRemain" class="dim mono" style="display:inline-block;min-width:22ch;font-variant-numeric:tabular-nums"></span></div>
       <div class="row" style="margin-top:12px">
         <span class="mono" style="font-size:12px">🟢</span>
         <input type="range" id="mSlider" min="102" max="255" step="1" value="102" style="flex:1;accent-color:#00f0ff;cursor:pointer">
@@ -303,19 +303,21 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '
 const pad = (n, l=2) => String(n).padStart(l, '0');
 const fmtDur = ms => { const s = Math.floor(ms / 1000);
   return `${pad(Math.floor(s / 3600))}:${pad(Math.floor(s / 60) % 60)}:${pad(s % 60)}.${pad(ms % 1000, 3)}`; };
+/* seconds-precision durations for live labels: fixed width => no layout flicker */
+const fmtDurS = ms => fmtDur(Math.max(0, ms)).split('.')[0];
 setInterval(() => {
   const d = new Date();
   $('clock').textContent = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
   if (window._boostSince && window._boostActive)
-    { const b = $('boostLine'); b.textContent = '⚡ boosted ' + fmtDur(Date.now() - window._boostSince); b.classList.remove('idle'); }
+    { const b = $('boostLine'); b.textContent = '⚡ boosted ' + fmtDurS(Date.now() - window._boostSince); b.classList.remove('idle'); }
   if (window._mUntil) {
     const left = window._mUntil - Date.now();
-    $('mRemain').textContent = left > 0 ? `expires in ${fmtDur(left)}` : 'expiring…';
+    $('mRemain').textContent = left > 0 ? `expires in ${fmtDurS(left)}` : 'expiring…';
     if (left <= 0) { window._mUntil = null; fetchManual(); }
   }
   const dn = Object.entries(downs);
   $('downBox').innerHTML = dn.length
-    ? dn.map(([k, since]) => `🔴 <b style="color:var(--red)">${k}</b> down ${fmtDur(Date.now() - since)}`).join(' &nbsp;·&nbsp; ')
+    ? dn.map(([k, since]) => `🔴 <b style="color:var(--red)">${k}</b> down ${fmtDurS(Date.now() - since)}`).join(' &nbsp;·&nbsp; ')
     : '🟢 all links up';
 }, 97);
 
@@ -473,7 +475,8 @@ function render(s) {
     $('tAvg').textContent = `avg ${s.truenas.avg}°C · max ${s.truenas.max}°C · n=${s.truenas.count} · src ${s.truenas.source || ''} · ${s.truenas.latency_ms ?? ''}ms`;
     $('tList').innerHTML = Object.entries(s.truenas.temps || {}).map(([k, v]) => {
       const cc = tempColor(v);
-      return `<span class="dchip" style="border-color:${cc};box-shadow:0 0 8px ${cc}55">💽 ${esc(k.replace('/dev/',''))} <b style="color:${cc}">${v}°C</b></span>`;
+      const tr = driveTrend(k.replace('/dev/', ''));
+      return `<span class="dchip" style="border-color:${cc};box-shadow:0 0 8px ${cc}55">💽 ${esc(k.replace('/dev/',''))} <b style="color:${cc}">${v}°C</b>${tr.arrow ? ` <span title="${esc(tr.title)}">${tr.arrow}</span>` : ''}</span>`;
     }).join('');
     if (window._wTemp != null) {
       const d = (s.truenas.max - window._wTemp).toFixed(1);
@@ -492,7 +495,7 @@ function render(s) {
   window._boostSince = b.active && b.since_ts ? new Date(b.since_ts).getTime() : null;
   window._boostActive = !!b.active;
   const bl = $('boostLine');
-  if (b.active) { bl.textContent = '⚡ boosted ' + fmtDur(Date.now() - window._boostSince); bl.classList.remove('idle'); }
+  if (b.active) { bl.textContent = '⚡ boosted ' + fmtDurS(Date.now() - window._boostSince); bl.classList.remove('idle'); }
   else { bl.textContent = '⚡ idle'; bl.classList.add('idle'); }
   const f1 = e => e ? `${e.event} ${e.ts.slice(11, 19)}` : '–';
   $('boostHist').textContent = `last ⬆️ ${f1(b.last_up)} · last ⬇️ ${f1(b.last_down)}`;
@@ -511,7 +514,24 @@ async function tick() {
   } catch (e) { /* keep last frame */ }
 }
 
-/* ---------- weather (Open-Meteo, free, ZIP configurable) ---------- */
+/* ---------- weather (Open-Meteo outside + Zigbee2MQTT room sensor, one tile) ---------- */
+function driveTrend(name) {
+  /* 60s trend from the history series chart() caches in window._lastSeries */
+  const pts = (window._lastSeries && window._lastSeries[name]) || [];
+  if (pts.length < 2 || pts[pts.length - 1].temp == null)
+    return {arrow: '', title: 'trend: waiting for history'};
+  const t1 = new Date(pts[pts.length - 1].ts).getTime();
+  let base = pts[0];
+  for (const p of pts) {
+    if (t1 - new Date(p.ts).getTime() >= 60000) base = p; else break;
+  }
+  if (base.temp == null) return {arrow: '', title: 'trend: waiting for history'};
+  const d = pts[pts.length - 1].temp - base.temp;
+  const ds = `${d >= 0 ? '+' : ''}${d.toFixed(1)}°C / 60s`;
+  if (d >= 0.5) return {arrow: '⬆️', title: 'rising ' + ds};
+  if (d <= -0.5) return {arrow: '⬇️', title: 'falling ' + ds};
+  return {arrow: '➡️', title: 'flat ' + ds};
+}
 async function fetchWeather() {
   if (DEMO) { // demo sky: partly cloudy 9°C
     window._wTemp = 9.5;
@@ -530,6 +550,12 @@ async function fetchWeather() {
         $('wDelta').textContent = `HDD max ${d >= 0 ? '+' : ''}${d}°C vs outside`;
       }
     } else { $('wEmoji').textContent = '⚪'; $('wText').textContent = w.error || 'off'; }
+    const indoor = w.indoor;
+    if (indoor && indoor.ok) {
+      $('wDelta').textContent += `${$('wDelta').textContent ? ' · ' : ''}🏠 ${indoor.temp}°C${indoor.humidity != null ? ` 💧 ${indoor.humidity}%` : ''} (room${indoor.age_s != null ? `, ${indoor.age_s}s ago` : ''})`;
+    } else if (indoor && indoor.ok === false) {
+      $('wDelta').textContent += `${$('wDelta').textContent ? ' · ' : ''}🏠 ${indoor.error || 'room sensor…'}`;
+    }
   } catch (e) {}
 }
 
@@ -803,6 +829,7 @@ $('mAuto').onclick = async () => { await postManual({auto: true}); };
 const SCHEMA = [
   {t:'🗄️ TrueNAS', f:[
     ['truenas.method','source','select',['auto','api','ssh'],'auto=API then SSH fallback'],
+    ['truenas.api_transport','API transport','select',['auto','ws','rest'],'ws=JSON-RPC (25.04+), rest=legacy'],
     ['truenas.api_url','API URL','text',null,'https://… (https only!)'],
     ['truenas.api_key','API key','password',null,'Bearer token'],
     ['truenas.verify_ssl','verify SSL','check',null,'off for self-signed'],
@@ -833,8 +860,8 @@ const SCHEMA = [
   ]},
   {t:'📡 MQTT', f:[
     ['mqtt.enabled','enabled','check'],['mqtt.broker','broker','text'],
-    ['mqtt.port','port','number'],['mqtt.username','username','text'],
-    ['mqtt.password','password','password'],['mqtt.base','topic base','text'],
+    ['mqtt.port','port','number'],['mqtt.username','username','text',null,'empty = anonymous (no login)'],
+    ['mqtt.password','password','password',null,'empty = anonymous'],['mqtt.base','topic base','text'],
   ]},
   {t:'🔔 ntfy', f:[
     ['ntfy.enabled','enabled','check'],['ntfy.url','topic URL','text'],
@@ -849,46 +876,89 @@ const SCHEMA = [
   ]},
   {t:'🌍 Outside weather', f:[
     ['weather.enabled','enabled','check',null,'Open-Meteo, free, no key'],
-    ['weather.postcode','postcode','text',null,'e.g. 33333'],
-    ['weather.country','country','text'],
+    ['weather.postcode','postcode','text',null,'e.g. 33333 / PIN code'],
+    ['weather.country','country','text',null,'must match the place country'],
+    ['weather.latitude','latitude','number',null,'optional: skips postcode lookup'],
+    ['weather.longitude','longitude','number',null,'optional: skips postcode lookup'],
+  ]},
+  {t:'🏠 Room sensor (Zigbee2MQTT)', f:[
+    ['sensors.enabled','enabled','check',null,'reads one z2m topic via the MQTT broker above'],
+    ['sensors.topic','MQTT topic','text',null,'e.g. zigbee2mqtt/<friendly-name>'],
+    ['sensors.temp_key','temp key','text',null,'JSON key, usually temperature'],
+    ['sensors.humidity_key','humidity key','text',null,'JSON key, usually humidity'],
   ]},
 ];
 const gval = (o, d) => d.split('.').reduce((a, k) => (a && a[k] !== undefined) ? a[k] : undefined, o);
 function renderForm(parsed) {
   $('easyPane').innerHTML = SCHEMA.map(s =>
-    `<div class="fsec"><h3>${s.t}</h3>` + s.f.map(([k, label, type, hint]) => {
+    `<div class="fsec"><h3>${s.t}</h3>` + s.f.map(([k, label, type, a, b]) => {
       const v = gval(parsed, k);
+      const opts = type === 'select' ? (a || []) : null;   /* selects: [k,label,select,OPTIONS,hint] */
+      const hint = type === 'select' ? b : a;              /* others:  [k,label,type,hint] */
       const inp = type === 'select'
-        ? `<select data-k="${k}">${['auto','api','ssh'].map(o => `<option ${o===v?'selected':''}>${o}</option>`).join('')}</select>`
+        ? `<select data-k="${k}">${opts.map(o => `<option ${o===v?'selected':''}>${o}</option>`).join('')}</select>`
         : type === 'check' ? `<input type="checkbox" data-k="${k}" data-t="check" ${v ? 'checked' : ''}>`
         : `<input data-k="${k}" data-t="${type}" type="${type==='password'?'password':type==='number'?'number':'text'}" value="${esc(v ?? '')}" placeholder="${esc(hint || '')}">`;
       return `<div class="frow"><label>${label}${hint ? `<small>${hint}</small>` : ''}</label>${inp}</div>`;
     }).join('') + `</div>`).join('');
 }
-$('tabEasy').onclick = () => { $('tabEasy').classList.add('on'); $('tabRaw').classList.remove('on'); $('easyPane').classList.remove('hidden'); $('rawPane').classList.add('hidden'); };
-$('tabRaw').onclick = () => { $('tabRaw').classList.add('on'); $('tabEasy').classList.remove('on'); $('rawPane').classList.remove('hidden'); $('easyPane').classList.add('hidden'); };
+function collectForm() {
+  const values = {};
+  document.querySelectorAll('#easyPane [data-k]').forEach(el => {
+    const t = el.dataset.t;
+    if (t === 'check') values[el.dataset.k] = el.checked;
+    else if (t === 'number') { if (el.value !== '') values[el.dataset.k] = parseFloat(el.value); }
+    else values[el.dataset.k] = el.value;
+  });
+  return values;
+}
+async function postPreview(body) {
+  const r = await fetch('/api/config/preview', {method: 'POST', headers: {...H(), 'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.detail || 'preview failed');
+  return j;
+}
+$('tabEasy').onclick = async () => {
+  /* raw -> form: parse the textarea so edits carry over (never silently dropped) */
+  try {
+    const j = await postPreview({content: $('cfgText').value});
+    renderForm(j.expanded || j.parsed || {});
+    $('cfgMsg').textContent = '';
+  } catch (e) { $('cfgMsg').textContent = '❌ ' + e.message; return; }
+  $('tabEasy').classList.add('on'); $('tabRaw').classList.remove('on'); $('easyPane').classList.remove('hidden'); $('rawPane').classList.add('hidden');
+};
+$('tabRaw').onclick = async () => {
+  /* form -> raw: serialize current inputs so edits carry over (never overridden) */
+  try {
+    const j = await postPreview({values: collectForm()});
+    $('cfgText').value = j.content;
+    $('cfgMsg').textContent = '';
+  } catch (e) { $('cfgMsg').textContent = '❌ ' + e.message; return; }
+  $('tabRaw').classList.add('on'); $('tabEasy').classList.remove('on'); $('rawPane').classList.remove('hidden'); $('easyPane').classList.add('hidden');
+};
 $('cfgBtn').onclick = async () => {
   const r = await (await fetch('/api/config', {headers: H()})).json();
   $('cfgPath').textContent = r.path; $('cfgText').value = r.content;
-  renderForm(r.parsed || {}); $('cfgMsg').textContent = '';
+  renderForm(r.expanded || r.parsed || {}); $('cfgMsg').textContent = '';
   $('cfgModal').style.display = 'flex';
 };
 $('cfgClose').onclick = () => $('cfgModal').style.display = 'none';
 $('cfgSave').onclick = async () => {
+  const rawMode = !$('rawPane').classList.contains('hidden');
+  if (!confirm(`Save config (${rawMode ? 'raw YAML' : 'easy form'}) to ${$('cfgPath').textContent || 'config.yaml'}?\n\nOverwrites the file on disk (.bak kept). Restart the controller afterwards to apply.`)) return;
   let body;
-  if ($('rawPane').classList.contains('hidden')) {
-    const values = {};
-    document.querySelectorAll('#easyPane [data-k]').forEach(el => {
-      const t = el.dataset.t;
-      if (t === 'check') values[el.dataset.k] = el.checked;
-      else if (t === 'number') { if (el.value !== '') values[el.dataset.k] = parseFloat(el.value); }
-      else values[el.dataset.k] = el.value;
-    });
-    body = {values};
-  } else body = {content: $('cfgText').value};
+  if (!rawMode) body = {values: collectForm()};
+  else body = {content: $('cfgText').value};
+  $('cfgMsg').textContent = '💾 saving…';
   const r = await fetch('/api/config', {method: 'POST', headers: {...H(), 'Content-Type': 'application/json'}, body: JSON.stringify(body)});
   const j = await r.json();
   $('cfgMsg').textContent = r.ok ? '✅ ' + j.note : '❌ ' + (j.detail || 'error');
+  if (r.ok) { /* refresh both panes from disk so they stay in sync after save */
+    try {
+      const g = await (await fetch('/api/config', {headers: H()})).json();
+      $('cfgText').value = g.content; renderForm(g.expanded || g.parsed || {});
+    } catch (e) {}
+  }
 };
 setInterval(tick, 3000); setInterval(() => { chart(); fetchManual(); }, 10000);
 setInterval(fetchWeather, 60000); setInterval(fetchHost, 15000);

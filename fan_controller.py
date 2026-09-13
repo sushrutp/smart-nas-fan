@@ -104,7 +104,7 @@ def log_startup(cfg):
         f"api_key={_mask(t.get('api_key'))} ssh_user={t.get('user')} verify_ssl={t.get('verify_ssl')} "
         f"hdd_only={t.get('hdd_only')} fail_threshold={t.get('fail_threshold')}")
     log_line(cfg,
-        f"config mqtt={m.get('broker')}:{m.get('port')} user={m.get('username') or '(empty)'} "
+        f"config mqtt={m.get('broker')}:{m.get('port')} user={(str(m.get('username') or '').strip() or '(anonymous)')} "
         f"pass={_mask(m.get('password'))} base={m.get('base')} | "
         f"ntfy={n.get('url') or '(empty)'} on_up={n.get('on_step_up')} on_fail={n.get('on_failsafe')} "
         f"on_api={n.get('on_api_fail')} on_rec={n.get('on_recovery')}")
@@ -769,8 +769,13 @@ class Pub:
         mcfg = cfg.get("mqtt", {})
         if mcfg.get("enabled") and mqtt:
             try:
+                # username/password are OPTIONAL: empty/missing = anonymous mode
+                # (e.g. Mosquitto with allow_anonymous true). Whitespace is stripped
+                # so " " from an env var can't break auth.
+                user = str(mcfg.get("username") or "").strip()
+                passwd = str(mcfg.get("password") or "")
                 debug(cfg, f"MQTT connect {mcfg['broker']}:{mcfg.get('port', 1883)} "
-                           f"user={mcfg.get('username') or '(empty)'} base={mcfg.get('base')}")
+                           f"user={(user or '(anonymous)')} base={mcfg.get('base')}")
                 # paho-mqtt >= 2.0: pass CallbackAPIVersion.VERSION2 or you get
                 # "Callback API version 1 is deprecated". Keep compat with 1.x.
                 try:
@@ -781,8 +786,8 @@ class Pub:
                 except (AttributeError, TypeError, ValueError):
                     self.m = mqtt.Client(client_id="smart-nas-fan-controller",
                                          clean_session=True)
-                if mcfg.get("username"):
-                    self.m.username_pw_set(mcfg["username"], mcfg.get("password", ""))
+                if user:
+                    self.m.username_pw_set(user, passwd)
                 base = mcfg.get("base", "smart-nas-fan")
                 self.m.will_set(f"{base}/online", "offline", retain=True)
                 self.m.connect(mcfg["broker"], int(mcfg.get("port", 1883)), 60)

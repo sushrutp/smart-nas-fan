@@ -633,19 +633,33 @@ def outside_weather(cfg):
         return _weather_cache["data"]
     try:
         pc, country = w.get("postcode", "33333"), w.get("country", "United States")
-        debug(f"weather: geocode postcode={pc} country={country}")
-        g = requests.get("https://geocoding-api.open-meteo.com/v1/search",
-                         params={"name": pc, "count": 5, "language": "en", "format": "json"},
-                         timeout=8).json()
-        place = None
-        for r in g.get("results", []):
-            if country.lower() in (r.get("country") or "").lower():
-                place = r
-                break
-        if not place:
-            top = (g.get("results") or [{}])[0]
-            return {"ok": False, "error": f"postcode {pc} not found in {country} "
-                    f"(top hit: {top.get('name', '?')}, {top.get('country', '?')}) — fix weather.postcode/country"}
+        lat, lon = w.get("latitude"), w.get("longitude")
+        if lat is not None and lon is not None:
+            # exact coordinates configured: skip geocoding entirely
+            debug(f"weather: using configured lat={lat} lon={lon}")
+            place = {"latitude": float(lat), "longitude": float(lon), "name": w.get("place") or pc}
+        else:
+            debug(f"weather: geocode postcode={pc} country={country}")
+            g = requests.get("https://geocoding-api.open-meteo.com/v1/search",
+                             params={"name": pc, "count": 8, "language": "en", "format": "json"},
+                             timeout=8).json()
+            results = g.get("results") or []
+            want = str(country or "").strip().lower()
+            place = None
+            for r in results:
+                rc = str(r.get("country") or "").lower()
+                # two-way match: "United States" vs "United States of America",
+                # plus ISO code match (r.country_code e.g. "IN")
+                if want and (want in rc or rc in want or
+                             want == str(r.get("country_code") or "").lower()):
+                    place = r
+                    break
+            if not place and len(results) == 1:
+                place = results[0]  # unambiguous single hit: take it
+            if not place:
+                top = results[0] if results else {}
+                return {"ok": False, "error": f"postcode {pc} not found in {country} "
+                        f"(top hit: {top.get('name', '?')}, {top.get('country', '?')}) — fix weather.postcode/country or set weather.latitude/longitude"}
         f = requests.get("https://api.open-meteo.com/v1/forecast",
                          params={"latitude": place["latitude"], "longitude": place["longitude"],
                                  "current": "temperature_2m,weather_code", "timezone": "auto"},
@@ -660,6 +674,99 @@ def outside_weather(cfg):
         return data
     except Exception as e:
         return {"ok": False, "error": str(e)[:120]}
+
+
+_z2m_cache: dict = {"ts": 0, "temp": None, "humidity": None, "error": "subscriber not started"}
+_z2m_started = False
+_z2m_lock = _th.Lock()
+
+
+def _z2m_ensure(cfg):
+    """Start the Zigbee2MQTT subscriber thread once (daemon, auto-reconnect).
+
+    Reuses the mqtt broker + credentials (anonymous when username is empty).
+    Never raises: failures land in _z2m_cache["error"] for the UI to show."""
+    global _z2m_started
+    if _z2m_started:
+        return
+    _z2m_started = True
+    s = cfg.get("sensors", {})
+    if not s.get("enabled", True):
+        _z2m_cache["error"] = "disabled"
+        return
+    topic = str(s.get("topic") or "").strip()
+    if not topic:
+        _z2m_cache["error"] = "set sensors.topic (e.g. zigbee2mqtt/<friendly-name>)"
+        return
+    try:
+        import paho.mqtt.client as pm
+    except ImportError:
+        _z2m_cache["error"] = "paho-mqtt not installed"
+        return
+    m = cfg.get("mqtt", {})
+    args = ((m.get("broker") or "").strip(), int(m.get("port", 1883)),
+            str(m.get("username") or "").strip(), str(m.get("password") or ""),
+            topic, str(s.get("temp_key") or "temperature"),
+            str(s.get("humidity_key") or "humidity"))
+    if not args[0]:
+        _z2m_cache["error"] = "mqtt.broker not set"
+        return
+    t = _th.Thread(target=_z2m_loop, args=(pm,) + args, daemon=True)
+    t.start()
+
+
+def _z2m_loop(pm, broker, port, user, passwd, topic, tkey, hkey):
+    """Blocking subscriber: caches the latest temp/humidity payload."""
+    def on_msg(_c, _u, msg):
+        try:
+            p = json.loads(msg.payload.decode())
+            t, h = p.get(tkey), p.get(hkey)
+            with _z2m_lock:
+                if isinstance(t, (int, float)):
+                    _z2m_cache["temp"] = round(float(t), 1)
+                if isinstance(h, (int, float)):
+                    _z2m_cache["humidity"] = round(float(h), 1)
+                _z2m_cache["ts"] = time.time()
+                _z2m_cache["error"] = None
+        except Exception as e:
+            with _z2m_lock:
+                _z2m_cache["error"] = f"bad payload: {e}"[:100]
+    while True:  # loop_forever reconnects on drops; outer loop survives fatal errors
+        try:
+            try:
+                cbv = pm.CallbackAPIVersion.VERSION2
+                c = pm.Client(callback_api_version=cbv, client_id="smart-nas-fan-admin-z2m")
+            except (AttributeError, TypeError, ValueError):
+                c = pm.Client(client_id="smart-nas-fan-admin-z2m")
+            if user:
+                c.username_pw_set(user, passwd)
+            c.on_message = on_msg
+            c.connect(broker, port, 60)
+            c.subscribe(topic, qos=0)
+            with _z2m_lock:
+                _z2m_cache["error"] = None
+            debug(f"z2m subscribe {broker}:{port} topic={topic} user={(user or '(anonymous)')}")
+            c.loop_forever(retry_first_connection=True)
+        except Exception as e:
+            with _z2m_lock:
+                _z2m_cache["error"] = str(e)[:120]
+            debug(f"z2m loop failed ({e}), retry in 15s")
+        time.sleep(15)
+
+
+def indoor_sensor(cfg):
+    """Latest Zigbee2MQTT temp/humidity reading (cached by the subscriber thread)."""
+    s = cfg.get("sensors", {})
+    if not s.get("enabled", True):
+        return {"ok": None, "error": "disabled"}
+    _z2m_ensure(cfg)
+    with _z2m_lock:
+        snap = dict(_z2m_cache)
+    if snap.get("temp") is None:
+        return {"ok": False, "error": snap.get("error") or "waiting for first MQTT message",
+                "topic": str(s.get("topic") or "")}
+    return {"ok": True, "temp": snap["temp"], "humidity": snap.get("humidity"),
+            "age_s": int(time.time() - snap["ts"]), "topic": str(s.get("topic") or "")}
 
 
 def build_status():
@@ -802,41 +909,85 @@ _metrics_cache: dict = {}
 
 
 def truenas_metrics(cfg):
-    """TrueNAS CPU% + RAM% + array read/write MB/s via reporting.get_data. Cached 30s."""
+    """TrueNAS CPU% + RAM% + array read/write MB/s via reporting.get_data. Cached 30s.
+
+    New JSON-RPC API takes POSITIONAL params [graphs, query] (page>=1);
+    the old dict body {"graphs":..,"reporting_query":..} is rejected, which is
+    why NAS CPU/RAM + array I/O showed empty on 25.04+.
+    """
     now = time.time()
     if _metrics_cache.get("ts", 0) > now - 30 and _metrics_cache.get("data"):
         return _metrics_cache["data"]
     try:
-        out = _tn_req(cfg, "reporting/get_data", {
-            "graphs": [{"name": "cpu"}, {"name": "memory"}, {"name": "disk"}],
-            "reporting_query": {"unit": "HOUR", "page": 0, "aggregate": True}}, timeout=15)
+        out = _tn_req(cfg, "reporting.get_data", [
+            [{"name": "cpu"}, {"name": "memory"}, {"name": "disk"}],
+            {"unit": "HOUR", "page": 1, "aggregate": True}], timeout=15)
         graphs = {g.get("name"): g for g in (out if isinstance(out, list) else [])}
+        debug(f"reporting graphs: {sorted(graphs)}")
+
+        def row_vals(leg, row):
+            """One data row (dict OR list) -> values aligned to legend, or []."""
+            if isinstance(row, dict):
+                ordered = ([row[k] for k in leg if k in row]
+                           or [v for k, v in row.items() if k != "timestamp"])
+                try:
+                    return [float(v) for v in ordered]
+                except (TypeError, ValueError):
+                    return []
+            if isinstance(row, (list, tuple)) and row:
+                try:
+                    return [float(v) for v in row]
+                except (TypeError, ValueError):
+                    return []
+            return []
 
         def vals(g):
+            """(legend, values) from aggregations.mean (dict OR list),
+            falling back to the last data row (dict OR list row)."""
             if not isinstance(g, dict):
                 return [], []
-            leg = [str(x).lower() for x in g.get("legend", [])]
-            agg = (g.get("aggregations") or {}).get("mean") or []
-            if agg:
-                return leg, [float(v) for v in agg]
-            data = g.get("data") or []
-            return leg, [float(v) for v in data[-1]] if data else []
+            leg = [str(x) for x in (g.get("legend") or [])]
+            mean = (g.get("aggregations") or {}).get("mean")
+            if isinstance(mean, dict) and mean:
+                ordered = ([mean[k] for k in leg if k in mean]
+                           or [v for k, v in mean.items() if k in leg]
+                           or list(mean.values()))
+                try:
+                    return leg, [float(v) for v in ordered]
+                except (TypeError, ValueError):
+                    pass
+            if isinstance(mean, (list, tuple)) and mean:
+                try:
+                    return leg, [float(v) for v in mean]
+                except (TypeError, ValueError):
+                    pass
+            rows = g.get("data") or []
+            if rows:
+                rv = row_vals(leg, rows[-1])
+                if rv:
+                    return leg, rv
+            return leg, []
 
         res = {"ok": True}
         leg, v = vals(graphs.get("cpu"))
+        low = [x.lower() for x in leg]
         if v and sum(v) > 0:
-            idle = v[leg.index("idle")] if "idle" in leg else v[-1]
+            idle = v[low.index("idle")] if "idle" in low else v[-1]
             res["cpu"] = round(100 * (sum(v) - idle) / sum(v), 1)
         leg, v = vals(graphs.get("memory"))
+        low = [x.lower() for x in leg]
         if v and sum(v) > 0:
-            used = v[leg.index("used")] if "used" in leg else v[0]
+            used = v[low.index("used")] if "used" in low else v[0]
             res["ram"] = round(100 * used / sum(v), 1)
         leg, v = vals(graphs.get("disk"))
+        low = [x.lower() for x in leg]
         data = (graphs.get("disk") or {}).get("data") or []
-        last = [float(x) for x in data[-1]] if data else v  # live point, not hourly mean
+        last = row_vals(leg, data[-1]) if data else []  # live point, not hourly mean
+        if not last:
+            last = v
         if last:
-            ri = leg.index("read") if "read" in leg else 0
-            wi = leg.index("write") if "write" in leg else (1 if len(last) > 1 else 0)
+            ri = low.index("read") if "read" in low else 0
+            wi = low.index("write") if "write" in low else (1 if len(last) > 1 else 0)
             res["read_mbs"] = round(max(0, last[ri]) / 1048576, 1)
             res["write_mbs"] = round(max(0, last[wi]) / 1048576, 1)
         if len(res) == 1:
@@ -946,7 +1097,10 @@ async def stream(token: str = ""):
 
 @app.get("/api/weather")
 def weather(_: bool = Depends(check_auth)):
-    return outside_weather(load_cfg())
+    cfg = load_cfg()
+    out = outside_weather(cfg)
+    out["indoor"] = indoor_sensor(cfg)  # same tile: room sensor next to outside temp
+    return out
 
 
 @app.get("/api/history")
@@ -978,7 +1132,16 @@ def drives(limit: int = 120, _: bool = Depends(check_auth)):
 @app.get("/api/config")
 def get_config(_: bool = Depends(check_auth)):
     content = read_text(cfg_path())
-    return {"path": cfg_path(), "content": content, "parsed": yaml.safe_load(content)}
+    parsed = yaml.safe_load(content)
+    # expanded: same file with $VAR/${VAR}/${VAR:-default} resolved from the
+    # live environment (native: smart-nas-fan.env via systemd EnvironmentFile,
+    # docker: compose env). The easy form renders from THIS so secrets and
+    # backend-set values are visible; password fields stay type=password.
+    try:
+        expanded = _expand_env(parsed)
+    except Exception:
+        expanded = parsed
+    return {"path": cfg_path(), "content": content, "parsed": parsed, "expanded": expanded}
 
 
 def _set_dotted(cfg, dotted, value):
@@ -989,6 +1152,31 @@ def _set_dotted(cfg, dotted, value):
             node[p] = {}
         node = node[p]
     node[parts[-1]] = value
+
+
+@app.post("/api/config/preview")
+async def preview_config(req: Request, _: bool = Depends(check_auth)):
+    """Dry-run conversion for tab sync (writes nothing):
+    {values} -> {content} (form state serialized to YAML),
+    {content} -> {parsed, expanded} (raw text parsed for the form).
+    Lets the easy/raw panes stay in sync so one can't silently override the other."""
+    body = await req.json()
+    current = yaml.safe_load(read_text(cfg_path()))
+    if "values" in body and isinstance(body["values"], dict):
+        for k, v in body["values"].items():
+            _set_dotted(current, k, v)
+        content = yaml.safe_dump(current, sort_keys=False, default_flow_style=False)
+        return {"ok": True, "content": content}
+    content = body.get("content", "")
+    try:
+        parsed = yaml.safe_load(content)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"invalid YAML: {e}")
+    try:
+        expanded = _expand_env(parsed)
+    except Exception:
+        expanded = parsed
+    return {"ok": True, "parsed": parsed, "expanded": expanded}
 
 
 @app.post("/api/config")

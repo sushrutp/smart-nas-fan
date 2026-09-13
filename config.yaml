@@ -64,3 +64,10 @@ weather:
   enabled: true
   postcode: '33333'
   country: United States
+  latitude:
+  longitude:
+sensors:
+  enabled: true
+  topic: zigbee2mqtt/0xa4c1380ac08fffff
+  temp_key: temperature
+  humidity_key: humidity

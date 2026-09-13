@@ -79,7 +79,14 @@ services:
       NASTEMP_CONFIG: /config/config.yaml
       ADMIN_USER: ${ADMIN_USER:-admin}
       ADMIN_PASS: ${ADMIN_PASS:?set ADMIN_PASS in .env (no default password)}
+      TRUENAS_HOST: ${TRUENAS_HOST:-}
+      TRUENAS_API_URL: ${TRUENAS_API_URL:-}
       TRUENAS_API_KEY: ${TRUENAS_API_KEY:-}
+      TRUENAS_USER: ${TRUENAS_USER:-}
+      MQTT_BROKER: ${MQTT_BROKER:-}
+      MQTT_USER: ${MQTT_USER:-}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+      NTFY_URL: ${NTFY_URL:-}
       # Remote mode (GUI on another VM/host, Proxmox reached over IP via SSH key):
       # Set these in .env instead of editing here:
       # PROXMOX_HOST, PROXMOX_USER, PROXMOX_PORT, PROXMOX_KEY, PROXMOX_CONFIG
