@@ -39,7 +39,7 @@ docker compose up -d --build admin
 ### B. Native on Proxmox, no Docker (local mode)
 
 ```bash
-sudo bash setup.sh   # installs controller + watchdog + admin (venv + systemd unit)
+sudo bash setup.sh /opt/smart-nas-fan   # installs controller + watchdog + admin (venv + systemd unit)
 # setup.sh writes secrets to /opt/smart-nas-fan/smart-nas-fan.env (0600), generates ADMIN_PASS if unset
 sudo systemctl start smart-nas-fan-admin
 ```

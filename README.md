@@ -125,7 +125,8 @@ Direct hardware access, no container overhead. Survives updates (see `INSTALL.md
 
 ```bash
 cd smart-nas-fan
-TRUENAS_API_KEY="..." NTFY_URL="..." ADMIN_PASS="..." sudo -E bash setup.sh
+TRUENAS_API_KEY="..." NTFY_URL="..." ADMIN_PASS="..." sudo -E bash setup.sh /opt/smart-nas-fan
+# (no path arg = install into the current directory; --dry-run previews, --help lists options)
 nano /opt/smart-nas-fan/config.yaml   # installed copy — non-secret tuning
 sudo systemctl start smart-nas-fan-controller smart-nas-fan-watchdog smart-nas-fan-admin
 systemctl status smart-nas-fan-controller smart-nas-fan-watchdog smart-nas-fan-admin

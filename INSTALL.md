@@ -44,8 +44,9 @@ Rule of thumb: allow Proxmox out to TrueNAS + broker + ntfy. Only inbound port i
 
 ```bash
 cd smart-nas-fan
-TRUENAS_API_KEY="..." NTFY_URL="..." ADMIN_PASS="..." sudo -E bash setup.sh
+TRUENAS_API_KEY="..." NTFY_URL="..." ADMIN_PASS="..." sudo -E bash setup.sh /opt/smart-nas-fan
 # (omit any var: setup.sh generates ADMIN_PASS and prints it once)
+# (no path arg = install into the current directory; --dry-run previews, --help lists options)
 nano /opt/smart-nas-fan/config.yaml   # installed copy — non-secret tuning (secrets live in /opt/smart-nas-fan/smart-nas-fan.env)
 sudo systemctl start smart-nas-fan-controller smart-nas-fan-watchdog smart-nas-fan-admin
 systemctl status smart-nas-fan-controller smart-nas-fan-watchdog smart-nas-fan-admin
@@ -60,7 +61,7 @@ systemctl status smart-nas-fan-controller smart-nas-fan-watchdog smart-nas-fan-a
   `setup.sh` is idempotent: it rebuilds the isolated venv + units from scratch and
   **never overwrites** your live config:
   ```bash
-  cd ~/smart-nas-fan && git pull && sudo bash setup.sh
+  cd ~/smart-nas-fan && git pull && sudo bash setup.sh /opt/smart-nas-fan
   sudo systemctl restart smart-nas-fan-controller smart-nas-fan-watchdog smart-nas-fan-admin
   modprobe it87   # only if `grep -H . /sys/class/hwmon/hwmon*/name` lost it87 after a kernel update
   ```
@@ -81,7 +82,7 @@ systemctl status smart-nas-fan-controller smart-nas-fan-watchdog smart-nas-fan-a
   sudo systemctl disable nastemp-controller nastemp-watchdog nastemp-admin 2>/dev/null
   sudo cp /opt/nastemp/config.yaml /tmp/config-backup.yaml
   sudo cp /opt/nastemp/nastemp.env /tmp/env-backup 2>/dev/null
-  cd ~/smart-nas-fan && git pull && sudo bash setup.sh
+  cd ~/smart-nas-fan && git pull && sudo bash setup.sh /opt/smart-nas-fan
   # re-apply your settings from the backups, then start the new units
   ```
   `NASTEMP_*` env names and `ntok` browser storage intentionally unchanged.
