@@ -454,7 +454,41 @@ def _tn_temps_from_results(cfg, disks, raw, t0, transport="ws"):
             "count": len(vals), "temps": temps, "latency_ms": ms}
 
 
+_tn_temps_cache: dict = {"ts": 0, "data": None}
+
+
+def _poll_ttl(cfg, key, default, lo, hi):
+    """Poll/cache interval knob from truenas.* config, clamped sane.
+
+    Guards against 0/negative (would hammer TrueNAS with a TLS+auth handshake
+    per status push) and absurd highs (stale tiles). Non-numeric -> default."""
+    try:
+        v = float(cfg.get("truenas", {}).get(key, default))
+    except (TypeError, ValueError):
+        v = default
+    return max(lo, min(hi, v))
+
+
 def truenas_api(cfg):
+    """HDD temps via TrueNAS API. Cached 15s (successes only).
+
+    TrueNAS itself caches disk temperatures for up to 5 minutes, so this loses
+    nothing — but it stops opening a fresh TLS+auth WebSocket session on every
+    ~2s status push, which on some boxes manifests as frequent connection drops
+    (and needlessly hammers middlewared). Failures are never cached, so
+    recovery is still noticed on the next poll.
+    Tune with truenas.poll_temps_sec (default 15, clamped 5..300)."""
+    now = time.time()
+    if _tn_temps_cache.get("ts", 0) > now - _poll_ttl(cfg, "poll_temps_sec", 15, 5, 300) \
+            and _tn_temps_cache.get("data"):
+        return _tn_temps_cache["data"]
+    res = _truenas_api_live(cfg)
+    if res.get("ok"):
+        _tn_temps_cache.update(ts=now, data=res)
+    return res
+
+
+def _truenas_api_live(cfg):
     """HDD temps via TrueNAS API. Returns dict with ok/temps/error/latency."""
     t = cfg.get("truenas", {})
     key = os.environ.get("TRUENAS_API_KEY") or t.get("api_key") or ""
@@ -1328,9 +1362,12 @@ def truenas_metrics(cfg):
     Chain: live WS hub (reporting.realtime, ~2s frames, no per-call cost)
     -> WS reporting.get_data poll -> legacy REST. Each stage's error is kept
     so the GUI note shows the REAL cause instead of only the last failure.
+    Poll cadence for the WS/REST stages: truenas.poll_metrics_sec
+    (default 30, clamped 10..600). The realtime hub pushes regardless.
     """
     now = time.time()
-    if _metrics_cache.get("ts", 0) > now - 30 and _metrics_cache.get("data"):
+    if _metrics_cache.get("ts", 0) > now - _poll_ttl(cfg, "poll_metrics_sec", 30, 10, 600) \
+            and _metrics_cache.get("data"):
         return _metrics_cache["data"]
     errs = []
     rt = truenas_realtime(cfg)

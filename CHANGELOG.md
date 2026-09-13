@@ -5,6 +5,10 @@ The `VERSION` file + admin UI header badge always show the current release.
 Releases go straight to `main`.
 
 ## [Unreleased]
+### Added
+- Poll cadence knobs: `truenas.poll_temps_sec` (default 15, clamped 5..300)
+  and `truenas.poll_metrics_sec` (default 30, clamped 10..600), both in the
+  GUI form. Controller loop rate stays `timing.interval_sec`.
 ### Changed
 - GUI↔backend is one websocket now: `GET /ws?token=` pushes status (2s),
   manual (10s), host/plug/logs/netlog (12–15s), chart (30s), weather (60s)

@@ -85,7 +85,7 @@ holds `${VAR}` / `${VAR:-default}` placeholders, expanded at load.
 | `ADMIN_DEBUG` (or `NASTEMP_DEBUG`) | off | debugging | Verbose probe trace, secrets masked (see below) |
 
 Controller-side knobs the UI respects (in `config.yaml`, editable in the UI form):
-`truenas.*` (API/SSH, `api_transport: auto/ws/rest`, HDD-only), `fan.*`, `temps_c.*`,
+`truenas.*` (API/SSH, `api_transport`, poll cadences, HDD-only), `fan.*`, `temps_c.*`,
 `timing.*`, `mqtt.*` (user/pass optional = anonymous), `ntfy.*` (`+on_api_fail`,
 `on_recovery`), `weather.*` (postcode/country or latitude/longitude),
 `sensors.*` (Zigbee2MQTT room topic/keys), `manual.*` (`enabled`, `max_sec`
@@ -131,6 +131,7 @@ on any transport (countdown labels render whole seconds so they don't flicker).
 | Login loops / 401s | Wrong password, or token expired (12h TTL — just log in again) |
 | Edits don't affect fans | Editor saves the file — restart the **controller** (`docker compose restart controller`) |
 | NAS gauges / array I/O empty | Card note shows the chain (`nas via realtime` vs `realtime: … \| ws: … \| rest: …`); API key needs `REPORTING_READ`; restart admin after key/config changes (hub + z2m threads bind at startup) |
+| TrueNAS connections drop often (even on LAN) | Read the reason, don't guess: GUI 📡 net log (under 📜 logs) + console `net[...]` lines show every WS↔REST transition with its cause. Native: `journalctl -u smart-nas-fan-admin \| grep "net\["` and `journalctl -u smart-nas-fan-controller \| grep -E "TRUENAS\|websocket\|REST"`. Docker: `docker compose logs admin controller \| grep -E "net\[\|TRUENAS\|websocket"`. Still vague? `ADMIN_DEBUG=1` (admin) / `debug: true` (controller) + restart prints every call + latency. Temps are cached 15s GUI-side so healthy systems open ~4 TrueNAS sessions/min, not ~30 — if drops persist, suspect middlewared restarts, IP conflict, or cable/port (`ethtool -S <nic> \| grep -i err`) |
 | Room sensor shows an error | `sensors.topic` must match the Zigbee2MQTT topic (default `zigbee2mqtt/<friendly-name>`); the error names the `broker:port` it failed on — from the admin host run `nc -zv <broker> 1883` (use the Pi's LAN IP, never `localhost`, unless admin runs on the Pi itself); restart admin after broker/topic changes |
 | Port in use | Another admin running: `ps aux \| grep uvicorn` / `docker ps` |
 

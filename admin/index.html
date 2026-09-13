@@ -916,6 +916,8 @@ const SCHEMA = [
     ['truenas.key_path','SSH key path','text'],
     ['truenas.timeout_sec','timeout (s)','number'],
     ['truenas.fail_threshold','fail threshold','number','fails before failsafe + ntfy'],
+    ['truenas.poll_temps_sec','poll temps (s)','number','TrueNAS temp cache 15 (5..300)'],
+    ['truenas.poll_metrics_sec','poll metrics (s)','number','CPU/RAM/IO cache 30 (10..600)'],
   ]},
   {t:'🌀 Fan', f:[
     ['fan.pwm_channel','PWM channel','text',null,'e.g. pwm2'],

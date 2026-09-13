@@ -12,6 +12,8 @@ truenas:
   timeout_sec: 8
   drives: []
   fail_threshold: 3
+  poll_temps_sec: 15
+  poll_metrics_sec: 30
 fan:
   pwm_channel: pwm2
   driver_match: it87
