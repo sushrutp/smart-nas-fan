@@ -119,16 +119,22 @@ ntfy flash on new event, shared-axis chart (🌡️ temp + 🌀 fan% + 🔔 ntfy
   3 HDDs with heat waves **plus random system faults** (🔥 banner, red lines) so you can
   see the whole show with no hardware.
 - **🌍 outside weather** (Open-Meteo, free, no key): set `weather.postcode` (default
-  `33333`) + `weather.country`, compare HDD max Δ vs outside with condition emoji
-  (☀️🌧️❄️⛈️🌫️…).
+  `33333`) + `weather.country`, or `weather.latitude`/`weather.longitude` to skip
+  the lookup entirely. Compare HDD max Δ vs outside with condition emoji
+  (☀️🌧️❄️⛈️🌫️…). The same tile shows the **🏠 room sensor** (Zigbee2MQTT
+  temp/humidity via `sensors.topic`, e.g. `zigbee2mqtt/<friendly-name>`).
 - Live data pushes over **SSE `/stream`** (auto-reconnect, polling fallback); flow lines are
   **green = flowing, blue = idle, red glow = broken**, with **⚡ ping ms** on the
   TrueNAS + MQTT arrows.
-- **🎛️ Manual fan control card**: slider (live ≤5s) + ⬆️/⬇️ ±10 + 🔥 boost (ceiling) +
+- **🎛️ Manual fan control card**: slider (picked up in ≤2s, GUI re-polls instantly) + ⬆️/⬇️ ±10 + 🔥 boost (ceiling) +
   🟢 quiet (floor) + 🤖 auto-release. Safety: auto-expires (`manual.max_sec`),
   never below floor, 🌡️ critical always wins, `fan/mode` topic for HA. Disabled in demo.
-- **🖥️ Host metrics + 💽 array I/O**: CPU/RAM gauges for Proxmox + TrueNAS (via
-  `reporting.get_data`), live read/write MB/s (heavy scrub/backup explains temp spikes).
+- **🖥️ Host metrics + 💽 array I/O**: CPU/RAM gauges for Proxmox + TrueNAS —
+  live from the persistent WebSocket `reporting.realtime` feed (`nas via realtime`),
+  with WS `get_data` + legacy REST as failsafes (the card note shows which stage
+  feeds it, or the real error). Live read/write MB/s (heavy scrub/backup explains temp spikes).
+- Config editor shows backend `.env` values (passwords stay masked), asks for
+  confirmation before saving, and keeps the 🧪 form / 📝 raw panes in sync.
 - **📨 Send Test Alert** button in the ntfy card verifies the push pipeline on demand.
 
 ```bash
@@ -188,6 +194,7 @@ echo 102 > $(grep -l "it87" /sys/class/hwmon/hwmon*/name | sed 's/name/pwm2/')  
 
 # 2. TrueNAS API (from Proxmox):
 curl -k -H "Authorization: Bearer <API-KEY>" https://192.168.1.10/api/v2.0/system/info | head -c 200
+# (legacy REST check — the app uses WebSocket JSON-RPC on /api/current; REST is only a failsafe)
 # expect JSON. Empty/401 = wrong key. Key revoked? = you used http:// once, create new key, use https:// only.
 
 # 3. TrueNAS SSH fallback (from Proxmox):

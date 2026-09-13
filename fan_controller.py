@@ -763,43 +763,72 @@ def target_for_temp(cfg, max_temp):
 # ---------- MQTT + ntfy ----------
 
 class Pub:
+    RECONNECT_EVERY = 30  # background reconnect throttle (s); startup connects immediately
+
     def __init__(self, cfg):
         self.cfg = cfg
         self.m = None
-        mcfg = cfg.get("mqtt", {})
-        if mcfg.get("enabled") and mqtt:
-            try:
-                # username/password are OPTIONAL: empty/missing = anonymous mode
-                # (e.g. Mosquitto with allow_anonymous true). Whitespace is stripped
-                # so " " from an env var can't break auth.
-                user = str(mcfg.get("username") or "").strip()
-                passwd = str(mcfg.get("password") or "")
-                debug(cfg, f"MQTT connect {mcfg['broker']}:{mcfg.get('port', 1883)} "
-                           f"user={(user or '(anonymous)')} base={mcfg.get('base')}")
-                # paho-mqtt >= 2.0: pass CallbackAPIVersion.VERSION2 or you get
-                # "Callback API version 1 is deprecated". Keep compat with 1.x.
-                try:
-                    _cbv = mqtt.CallbackAPIVersion.VERSION2  # type: ignore[attr-defined]
-                    self.m = mqtt.Client(callback_api_version=_cbv,
-                                         client_id="smart-nas-fan-controller",
-                                         clean_session=True)
-                except (AttributeError, TypeError, ValueError):
-                    self.m = mqtt.Client(client_id="smart-nas-fan-controller",
-                                         clean_session=True)
-                if user:
-                    self.m.username_pw_set(user, passwd)
-                base = mcfg.get("base", "smart-nas-fan")
-                self.m.will_set(f"{base}/online", "offline", retain=True)
-                self.m.connect(mcfg["broker"], int(mcfg.get("port", 1883)), 60)
-                self.m.loop_start()
-                self.m.publish(f"{base}/online", "online", retain=True)
-                debug(cfg, "MQTT connected + LWT set")
-            except Exception as e:
-                print(f"MQTT connect failed: {e}", flush=True)
-                self.m = None
+        self._last_try = 0
+        self._fail = None
+        if not self.ensure(force=True):
+            print(f"MQTT connect failed: {self._fail} (will retry in background)", flush=True)
+
+    def _connect(self):
+        """One connect attempt. Raises on failure; on success sets self.m + LWT/online."""
+        mcfg = self.cfg.get("mqtt", {})
+        # username/password are OPTIONAL: empty/missing = anonymous mode
+        # (e.g. Mosquitto with allow_anonymous true). Whitespace is stripped
+        # so " " from an env var can't break auth.
+        user = str(mcfg.get("username") or "").strip()
+        passwd = str(mcfg.get("password") or "")
+        debug(self.cfg, f"MQTT connect {mcfg['broker']}:{mcfg.get('port', 1883)} "
+                        f"user={(user or '(anonymous)')} base={mcfg.get('base')}")
+        # paho-mqtt >= 2.0: pass CallbackAPIVersion.VERSION2 or you get
+        # "Callback API version 1 is deprecated". Keep compat with 1.x.
+        try:
+            _cbv = mqtt.CallbackAPIVersion.VERSION2  # type: ignore[attr-defined]
+            self.m = mqtt.Client(callback_api_version=_cbv,
+                                 client_id="smart-nas-fan-controller",
+                                 clean_session=True)
+        except (AttributeError, TypeError, ValueError):
+            self.m = mqtt.Client(client_id="smart-nas-fan-controller",
+                                 clean_session=True)
+        if user:
+            self.m.username_pw_set(user, passwd)
+        base = mcfg.get("base", "smart-nas-fan")
+        self.m.will_set(f"{base}/online", "offline", retain=True)
+        self.m.connect(mcfg["broker"], int(mcfg.get("port", 1883)), 60)
+        self.m.loop_start()
+        self.m.publish(f"{base}/online", "online", retain=True)
+        debug(self.cfg, "MQTT connected + LWT set")
+
+    def ensure(self, force=False):
+        """Make sure we're connected (throttled reconnect). True when ready to publish."""
+        if self.m:
+            return True
+        mcfg = self.cfg.get("mqtt", {})
+        if not (mcfg.get("enabled") and mqtt):
+            return False
+        now = time.time()
+        if not force and now - self._last_try < self.RECONNECT_EVERY:
+            return False
+        self._last_try = now
+        was_down = self._fail is not None
+        try:
+            self._connect()
+            self._fail = None
+            if was_down:
+                log_line(self.cfg, "MQTT RECONNECTED, resuming telemetry")
+            return True
+        except Exception as e:
+            self._fail = str(e)[:120]
+            self.m = None
+            if force:
+                debug(self.cfg, f"MQTT connect failed: {self._fail}")
+            return False
 
     def pub(self, sub, val, retain=None):
-        if not self.m:
+        if not self.ensure():
             return
         base = self.cfg["mqtt"].get("base", "smart-nas-fan")
         try:
@@ -808,6 +837,14 @@ class Pub:
             debug(self.cfg, f"MQTT -> {base}/{sub} = {str(val)[:100]}")
         except Exception as e:
             debug(self.cfg, f"MQTT publish {sub} failed: {e}")
+            # drop the dead client so the next pub() reconnects instead of
+            # silently black-holing telemetry until restart
+            try:
+                self.m.loop_stop()
+            except Exception:
+                pass
+            self.m = None
+            self._fail = str(e)[:120]
 
 def ntfy(cfg, msg, title="smart-nas-fan", priority="default", tags=""):
     n = cfg.get("ntfy", {})
@@ -1106,12 +1143,13 @@ def main():
             log_db(cfg, rec, temps, None)
 
         heartbeat(cfg)
-        # Chunked sleep: re-check the manual override every ≤5s so the UI
+        # Chunked sleep: re-check the manual override every ≤2s so the UI
         # slider feels real-time instead of waiting out the 30s cycle.
+        # (override check is a single file stat: cheap.)
         elapsed = time.time() - loop_start
         deadline = time.time() + max(5, TM["interval_sec"] - elapsed)
         while True:
-            time.sleep(min(5, max(1, deadline - time.time())))
+            time.sleep(min(2, max(1, deadline - time.time())))
             if time.time() >= deadline:
                 break
             if override_sig(cfg) != last_ov_sig:

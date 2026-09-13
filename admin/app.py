@@ -908,94 +908,271 @@ def _proxmox_host_remote():
 _metrics_cache: dict = {}
 
 
-def truenas_metrics(cfg):
-    """TrueNAS CPU% + RAM% + array read/write MB/s via reporting.get_data. Cached 30s.
+# ---------- persistent TrueNAS WS hub: live reporting.realtime feed ----------
+# One long-lived, auto-reconnecting WebSocket: auth once, subscribe once to
+# `reporting.realtime` (TrueNAS pushes cpu/disks/memory every ~2s), cache the
+# latest frame. Endpoints serve the cache = real-time data with zero per-call
+# handshake. Polling (WS get_data) and legacy REST are only fallbacks.
 
-    New JSON-RPC API takes POSITIONAL params [graphs, query] (page>=1);
-    the old dict body {"graphs":..,"reporting_query":..} is rejected, which is
-    why NAS CPU/RAM + array I/O showed empty on 25.04+.
+_tnhub = {"started": False, "ts": 0, "fields": None, "error": "hub not started"}
+_tnhub_lock = _th.Lock()
+
+
+def _tnhub_open(cfg, timeout=10):
+    """Open + authenticate one WS connection. Shared by hub and one-shot calls."""
+    try:
+        import websocket
+    except ImportError:
+        raise RuntimeError("websocket-client not installed")
+    t = cfg.get("truenas", {})
+    key = os.environ.get("TRUENAS_API_KEY") or t.get("api_key") or ""
+    if not key:
+        raise RuntimeError("api_key missing")
+    url = _tn_ws_url(cfg)
+    to = min(int(t.get("timeout_sec", 8)), timeout)
+    verify = bool(t.get("verify_ssl", False))
+    sslopt = {"cert_reqs": ssl.CERT_NONE, "check_hostname": False} if not verify else {}
+    ws = websocket.create_connection(url, timeout=to, sslopt=sslopt)
+    try:
+        ws.send(json.dumps({"jsonrpc": "2.0", "id": 1,
+                            "method": "auth.login_with_api_key", "params": [key]}))
+        if _tn_ws_recv(ws, 1, to) is not True:
+            raise RuntimeError("ws auth rejected")
+        return ws
+    except Exception:
+        try:
+            ws.close()
+        except Exception:
+            pass
+        raise
+
+
+def _tnhub_ensure(cfg):
+    """Start the hub thread once. Never raises; status lands in _tnhub."""
+    if _tnhub["started"]:
+        return
+    _tnhub["started"] = True
+    t = _th.Thread(target=_tnhub_loop, args=(cfg,), daemon=True)
+    t.start()
+
+
+def _tnhub_loop(cfg):
+    """Hold the connection forever: subscribe, cache realtime frames, reconnect."""
+    rid = 100
+    while True:
+        try:
+            ws = _tnhub_open(cfg, timeout=12)
+            try:
+                rid += 1
+                ws.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": "core.subscribe",
+                                    "params": ["reporting.realtime"]}))
+                sub_id = _tn_ws_recv(ws, rid, 12)
+                debug(f"tnhub subscribed reporting.realtime -> {sub_id}")
+                with _tnhub_lock:
+                    _tnhub["error"] = None
+                ws.settimeout(30)
+                while True:
+                    try:
+                        raw = ws.recv()
+                    except Exception:
+                        # recv timeout doubles as a quiet-connection watchdog:
+                        # a cheap ping proves the socket is still alive.
+                        rid += 1
+                        ws.send(json.dumps({"jsonrpc": "2.0", "id": rid,
+                                            "method": "core.ping", "params": []}))
+                        _tn_ws_recv(ws, rid, 12)
+                        continue
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+                    if not isinstance(msg, dict):
+                        continue
+                    p = msg.get("params") or {}
+                    # event notification: {"method":"collection_update","params":{
+                    #   "collection":"reporting.realtime","fields":{...}}}
+                    if (msg.get("method") == "collection_update"
+                            and p.get("collection") == "reporting.realtime"
+                            and isinstance(p.get("fields"), dict)):
+                        with _tnhub_lock:
+                            _tnhub["fields"] = p["fields"]
+                            _tnhub["ts"] = time.time()
+                            _tnhub["error"] = None
+            finally:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            with _tnhub_lock:
+                _tnhub["error"] = str(e)[:140]
+            debug(f"tnhub loop failed ({e}), retry in 10s")
+        time.sleep(10)
+
+
+def truenas_realtime(cfg):
+    """Live NAS cpu/ram/disk-IO from the hub cache (fresh < 15s). No API call."""
+    _tnhub_ensure(cfg)
+    with _tnhub_lock:
+        snap = dict(_tnhub)
+    age = time.time() - snap.get("ts", 0)
+    f = snap.get("fields")
+    if not isinstance(f, dict) or age > 15:
+        err = snap.get("error") or "no realtime frame yet"
+        return {"ok": False, "error": f"realtime: {err}"[:140]}
+    try:
+        res = {"ok": True, "source": "realtime", "age_s": int(age)}
+        cpu = (f.get("cpu") or {}).get("cpu") or {}
+        if isinstance(cpu.get("usage"), (int, float)):
+            res["cpu"] = round(float(cpu["usage"]), 1)
+        mem = f.get("memory") or {}
+        total, avail = mem.get("physical_memory_total"), mem.get("physical_memory_available")
+        if isinstance(total, (int, float)) and total > 0 and isinstance(avail, (int, float)):
+            res["ram"] = round(100 * (1 - avail / total), 1)
+        dk = f.get("disks") or {}
+        if isinstance(dk.get("read_bytes"), (int, float)):
+            res["read_mbs"] = round(max(0, float(dk["read_bytes"])) / 1048576, 1)
+        if isinstance(dk.get("write_bytes"), (int, float)):
+            res["write_mbs"] = round(max(0, float(dk["write_bytes"])) / 1048576, 1)
+        if len(res) <= 3:  # only ok/source/age_s -> nothing usable parsed
+            return {"ok": False, "error": "realtime: unparseable frame"}
+        return res
+    except Exception as e:
+        return {"ok": False, "error": f"realtime parse: {e}"[:140]}
+
+
+def _parse_reporting_graphs(out):
+    """reporting.get_data payload -> {"ok":True,cpu,ram,read_mbs,write_mbs}.
+
+    Accepts dict OR list shapes for aggregations.mean and data rows
+    (they differ across TrueNAS versions). Raises RuntimeError if empty."""
+    graphs = {g.get("name"): g for g in (out if isinstance(out, list) else [])}
+    debug(f"reporting graphs: {sorted(graphs)}")
+
+    def row_vals(leg, row):
+        """One data row (dict OR list) -> values aligned to legend, or []."""
+        if isinstance(row, dict):
+            ordered = ([row[k] for k in leg if k in row]
+                       or [v for k, v in row.items() if k != "timestamp"])
+            try:
+                return [float(v) for v in ordered]
+            except (TypeError, ValueError):
+                return []
+        if isinstance(row, (list, tuple)) and row:
+            try:
+                return [float(v) for v in row]
+            except (TypeError, ValueError):
+                return []
+        return []
+
+    def vals(g):
+        """(legend, values) from aggregations.mean (dict OR list),
+        falling back to the last data row (dict OR list row)."""
+        if not isinstance(g, dict):
+            return [], []
+        leg = [str(x) for x in (g.get("legend") or [])]
+        mean = (g.get("aggregations") or {}).get("mean")
+        if isinstance(mean, dict) and mean:
+            ordered = ([mean[k] for k in leg if k in mean]
+                       or [v for k, v in mean.items() if k in leg]
+                       or list(mean.values()))
+            try:
+                return leg, [float(v) for v in ordered]
+            except (TypeError, ValueError):
+                pass
+        if isinstance(mean, (list, tuple)) and mean:
+            try:
+                return leg, [float(v) for v in mean]
+            except (TypeError, ValueError):
+                pass
+        rows = g.get("data") or []
+        if rows:
+            rv = row_vals(leg, rows[-1])
+            if rv:
+                return leg, rv
+        return leg, []
+
+    res = {"ok": True}
+    leg, v = vals(graphs.get("cpu"))
+    low = [x.lower() for x in leg]
+    if v and sum(v) > 0:
+        idle = v[low.index("idle")] if "idle" in low else v[-1]
+        res["cpu"] = round(100 * (sum(v) - idle) / sum(v), 1)
+    leg, v = vals(graphs.get("memory"))
+    low = [x.lower() for x in leg]
+    if v and sum(v) > 0:
+        used = v[low.index("used")] if "used" in low else v[0]
+        res["ram"] = round(100 * used / sum(v), 1)
+    leg, v = vals(graphs.get("disk"))
+    low = [x.lower() for x in leg]
+    data = (graphs.get("disk") or {}).get("data") or []
+    last = row_vals(leg, data[-1]) if data else []  # live point, not hourly mean
+    if not last:
+        last = v
+    if last:
+        ri = low.index("read") if "read" in low else 0
+        wi = low.index("write") if "write" in low else (1 if len(last) > 1 else 0)
+        res["read_mbs"] = round(max(0, last[ri]) / 1048576, 1)
+        res["write_mbs"] = round(max(0, last[wi]) / 1048576, 1)
+    if len(res) == 1:
+        raise RuntimeError("no metric parsed")
+    return res
+
+
+def _tn_rest_reporting_legacy(cfg, timeout=15):
+    """Last-resort legacy REST shape (pre-25.04 form): slash URL + dict body."""
+    t = cfg.get("truenas", {})
+    key = os.environ.get("TRUENAS_API_KEY") or t.get("api_key") or ""
+    if not key:
+        raise RuntimeError("api_key missing")
+    base = (t.get("api_url") or f"https://{t.get('host', '')}").rstrip("/")
+    verify = bool(t.get("verify_ssl", False))
+    if not verify:
+        requests.packages.urllib3.disable_warnings(
+            requests.packages.urllib3.exceptions.InsecureRequestWarning)
+    r = requests.post(f"{base}/api/v2.0/reporting/get_data",
+                      json={"graphs": [{"name": "cpu"}, {"name": "memory"}, {"name": "disk"}],
+                            "reporting_query": {"unit": "HOUR", "page": 1, "aggregate": True}},
+                      headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                      timeout=timeout, verify=verify)
+    r.raise_for_status()
+    return _parse_reporting_graphs(r.json())
+
+
+def truenas_metrics(cfg):
+    """TrueNAS CPU% + RAM% + array read/write MB/s. Cached 30s.
+
+    Chain: live WS hub (reporting.realtime, ~2s frames, no per-call cost)
+    -> WS reporting.get_data poll -> legacy REST. Each stage's error is kept
+    so the GUI note shows the REAL cause instead of only the last failure.
     """
     now = time.time()
     if _metrics_cache.get("ts", 0) > now - 30 and _metrics_cache.get("data"):
         return _metrics_cache["data"]
+    errs = []
+    rt = truenas_realtime(cfg)
+    if rt.get("ok"):
+        _metrics_cache.update(ts=now, data=rt)
+        return rt
+    errs.append(str(rt.get("error") or "realtime failed"))
     try:
-        out = _tn_req(cfg, "reporting.get_data", [
+        res = _parse_reporting_graphs(_tn_req(cfg, "reporting.get_data", [
             [{"name": "cpu"}, {"name": "memory"}, {"name": "disk"}],
-            {"unit": "HOUR", "page": 1, "aggregate": True}], timeout=15)
-        graphs = {g.get("name"): g for g in (out if isinstance(out, list) else [])}
-        debug(f"reporting graphs: {sorted(graphs)}")
-
-        def row_vals(leg, row):
-            """One data row (dict OR list) -> values aligned to legend, or []."""
-            if isinstance(row, dict):
-                ordered = ([row[k] for k in leg if k in row]
-                           or [v for k, v in row.items() if k != "timestamp"])
-                try:
-                    return [float(v) for v in ordered]
-                except (TypeError, ValueError):
-                    return []
-            if isinstance(row, (list, tuple)) and row:
-                try:
-                    return [float(v) for v in row]
-                except (TypeError, ValueError):
-                    return []
-            return []
-
-        def vals(g):
-            """(legend, values) from aggregations.mean (dict OR list),
-            falling back to the last data row (dict OR list row)."""
-            if not isinstance(g, dict):
-                return [], []
-            leg = [str(x) for x in (g.get("legend") or [])]
-            mean = (g.get("aggregations") or {}).get("mean")
-            if isinstance(mean, dict) and mean:
-                ordered = ([mean[k] for k in leg if k in mean]
-                           or [v for k, v in mean.items() if k in leg]
-                           or list(mean.values()))
-                try:
-                    return leg, [float(v) for v in ordered]
-                except (TypeError, ValueError):
-                    pass
-            if isinstance(mean, (list, tuple)) and mean:
-                try:
-                    return leg, [float(v) for v in mean]
-                except (TypeError, ValueError):
-                    pass
-            rows = g.get("data") or []
-            if rows:
-                rv = row_vals(leg, rows[-1])
-                if rv:
-                    return leg, rv
-            return leg, []
-
-        res = {"ok": True}
-        leg, v = vals(graphs.get("cpu"))
-        low = [x.lower() for x in leg]
-        if v and sum(v) > 0:
-            idle = v[low.index("idle")] if "idle" in low else v[-1]
-            res["cpu"] = round(100 * (sum(v) - idle) / sum(v), 1)
-        leg, v = vals(graphs.get("memory"))
-        low = [x.lower() for x in leg]
-        if v and sum(v) > 0:
-            used = v[low.index("used")] if "used" in low else v[0]
-            res["ram"] = round(100 * used / sum(v), 1)
-        leg, v = vals(graphs.get("disk"))
-        low = [x.lower() for x in leg]
-        data = (graphs.get("disk") or {}).get("data") or []
-        last = row_vals(leg, data[-1]) if data else []  # live point, not hourly mean
-        if not last:
-            last = v
-        if last:
-            ri = low.index("read") if "read" in low else 0
-            wi = low.index("write") if "write" in low else (1 if len(last) > 1 else 0)
-            res["read_mbs"] = round(max(0, last[ri]) / 1048576, 1)
-            res["write_mbs"] = round(max(0, last[wi]) / 1048576, 1)
-        if len(res) == 1:
-            return {"ok": False, "error": "no metric parsed"}
+            {"unit": "HOUR", "page": 1, "aggregate": True}], timeout=15))
+        res["source"] = "ws"
         _metrics_cache.update(ts=now, data=res)
         return res
     except Exception as e:
-        return {"ok": False, "error": str(e)[:140]}
+        errs.append(f"ws: {e}"[:140])
+        debug(f"truenas_metrics ws fallback failed: {e}")
+    try:
+        res = _tn_rest_reporting_legacy(cfg)
+        res["source"] = "rest"
+        _metrics_cache.update(ts=now, data=res)
+        return res
+    except Exception as e:
+        errs.append(f"rest: {e}"[:140])
+    return {"ok": False, "error": " | ".join(errs)[:220]}
 
 
 # ---------- routes ----------

@@ -7,8 +7,10 @@ stuck at high speed.
 - **Host:** Proxmox (Arctic P12 Pro daisy-chain on `it87` / `pwm2`)
   - Your known-good manual command is the hardware primitive:
     `echo 140 > $(grep -l "it87" /sys/class/hwmon/hwmon*/name | sed 's/name/pwm2/')`
-- **Temps:** TrueNAS HDDs only (SSD/NVMe ignored) — HTTPS API first
-  (`disk.query` + `disk.temperatures`), SSH + `smartctl` fallback
+- **Temps:** TrueNAS HDDs only (SSD/NVMe ignored) — JSON-RPC 2.0 over
+  WebSocket first (`/api/current`: `disk.query` + `disk.temperatures`),
+  SSH + `smartctl` fallback, legacy REST last resort
+  (`truenas.api_transport: auto` / `ws` / `rest`)
 - **Visibility:** Home Assistant via MQTT (Mosquitto) + ntfy push alerts +
   neon admin UI on `:6767` (local or remote, see `admin/README.md`)
 - **Secrets:** never in files — `.env` (Docker) / `/opt/smart-nas-fan/smart-nas-fan.env` (native).
@@ -78,11 +80,11 @@ Stepping per 30 s cycle: **+12 up / −6 down**. Step-down additionally requires
 | `watchdog.py` | Proxmox or `watchdog` container | layer-2 failsafe |
 | `admin/` (`app.py`, `index.html`, `Dockerfile`, `README.md`) | Proxmox or any VM (`:6767`) | neon control center, local + remote (SSH) mode |
 | `Dockerfile` / `docker-compose.yml` | Docker host | container install (alternative to systemd) |
-| `setup.sh` | Proxmox | native systemd install (venv + 3 units, idempotent) |
+| `setup.sh` | Proxmox | native systemd install (custom dir or cwd, venv + 3 units, idempotent, narrated) |
 | `test_fan.sh` | Proxmox | safe manual HW test |
 | `ha_sensors.yaml` | Home Assistant | MQTT sensors |
 | `ha_dashboard.yaml` | Home Assistant | Lovelace cards |
-| `requirements.txt` | build | controller deps (`paho-mqtt`, `paramiko`, `pyyaml`, `requests`) |
+| `requirements.txt` | build | controller deps (`paho-mqtt`, `paramiko`, `pyyaml`, `requests`, `websocket-client`) |
 | `ARCHITECTURE.md` / `INSTALL.md` / `VERSION` | repo | deep dive / setup guide / release |
 
 MQTT topics (`base: smart-nas-fan`): `hdd/<disk>/temp`, `hdd/max_temp`,
@@ -98,12 +100,14 @@ MQTT topics (`base: smart-nas-fan`): `hdd/<disk>/temp`, `hdd/max_temp`,
    If missing: `modprobe it87` (may need `acpi_enforce_resources=lax` on some boards).
 2. **TrueNAS:** API key (Credentials → API Keys, needs `REPORTING_READ`) **and/or**
    SSH with a `smartctl`-capable user + key auth:
-   ```bash
-   curl -k -H "Authorization: Bearer <API-KEY>" https://TRUENAS/api/v2.0/system/info
-   ssh-keygen -t ed25519 -N ""
-   ssh-copy-id admin@TRUENAS_IP
-   ```
-3. **HA:** Mosquitto broker running. Note broker IP / user / pass.
+    ```bash
+    curl -k -H "Authorization: Bearer <API-KEY>" https://TRUENAS/api/v2.0/system/info
+    # (legacy REST check — the app itself uses WebSocket JSON-RPC on /api/current)
+    ssh-keygen -t ed25519 -N ""
+    ssh-copy-id admin@TRUENAS_IP
+    ```
+3. **HA:** Mosquitto broker running. Note broker IP; user/pass are optional
+   (empty = anonymous, e.g. `allow_anonymous true`).
 4. **ntfy:** your server URL + topic, e.g. `http://192.168.1.5:8080/smart-nas-fan`.
 5. **Secrets first:** `cp .env.example .env && nano .env`
    (`ADMIN_PASS` required, `TRUENAS_API_KEY`, `MQTT_*`, `NTFY_URL`).

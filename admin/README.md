@@ -22,7 +22,7 @@ writes the self-expiring `override.json` for manual control.
 |---|---|
 | `app.py` | FastAPI backend: auth, live status APIs, SSE stream, config/manual/weather/metrics/export endpoints, local↔remote file layer |
 | `index.html` | Single-page neon UI (no build step, no CDN required except fonts): flow map, RGB fan, charts, gauges, editors |
-| `Dockerfile` | `python:3.12-slim` + `fastapi uvicorn pyyaml requests paramiko`, serves on `6767` |
+| `Dockerfile` | `python:3.12-slim` + `fastapi uvicorn pyyaml requests paramiko paho-mqtt websocket-client`, serves on `6767` |
 | `README.md` | This file |
 
 ## How to run
@@ -85,9 +85,11 @@ holds `${VAR}` / `${VAR:-default}` placeholders, expanded at load.
 | `ADMIN_DEBUG` (or `NASTEMP_DEBUG`) | off | debugging | Verbose probe trace, secrets masked (see below) |
 
 Controller-side knobs the UI respects (in `config.yaml`, editable in the UI form):
-`truenas.*` (API/SSH, HDD-only), `fan.*`, `temps_c.*`, `timing.*`, `mqtt.*`,
-`ntfy.*` (+`on_api_fail`, `on_recovery`), `weather.*` (postcode/country),
-`manual.*` (`enabled`, `max_sec` auto-expire, `min_pwm` stall floor).
+`truenas.*` (API/SSH, `api_transport: auto/ws/rest`, HDD-only), `fan.*`, `temps_c.*`,
+`timing.*`, `mqtt.*` (user/pass optional = anonymous), `ntfy.*` (`+on_api_fail`,
+`on_recovery`), `weather.*` (postcode/country or latitude/longitude),
+`sensors.*` (Zigbee2MQTT room topic/keys), `manual.*` (`enabled`, `max_sec`
+auto-expire, `min_pwm` stall floor).
 
 ## API reference (all need `Authorization: Bearer <token>` except `/` + login)
 
@@ -98,20 +100,24 @@ Controller-side knobs the UI respects (in `config.yaml`, editable in the UI form
 | `GET /stream?token=` | SSE push of status every 2s (UI uses this; polling fallback built in) |
 | `GET /api/fast` | Sub-second lane: fan + heartbeat in one roundtrip (UI polls 1s in remote mode) |
 | `GET /api/history?limit=` / `GET /api/drives?limit=` | Chart data: aggregate + per-drive series |
-| `GET /api/config` / `POST /api/config` | Read / save config (`{content}` raw or `{values}` dotted-keys form) |
-| `GET /api/manual` / `POST /api/manual` | Slider state / set `{pwm, seconds?, by?}` / release `{auto:true}` |
-| `GET /api/hostmetrics` | Proxmox CPU/RAM + TrueNAS CPU/RAM + array MB/s |
+| `GET /api/config` / `POST /api/config` | Read (form renders env-expanded values, passwords masked) / save config (`{content}` raw or `{values}` dotted-keys form, asks confirm, `.bak` kept) |
+| `POST /api/config/preview` | Dry-run conversion (writes nothing) — keeps easy/raw panes in sync across tab switches |
+| `GET /api/manual` / `POST /api/manual` | Slider state / set `{pwm, seconds?, by?}` / release `{auto:true}` (picked up in ≤2s) |
+| `GET /api/hostmetrics` | Proxmox CPU/RAM + TrueNAS CPU/RAM + array MB/s (live `realtime` WS feed; `source` field says `realtime`/`ws`/`rest`) |
 | `POST /api/ntfy-test` | Send Test Alert push |
 | `GET /api/export?kind=readings\|events` | CSV download (opens in Excel) |
-| `GET /api/weather` | Outside temp + condition emoji (Open-Meteo, cached 10 min) |
+| `GET /api/weather` | Outside temp + condition emoji (Open-Meteo, cached 10 min) + `indoor` room temp/humidity from Zigbee2MQTT |
 | `GET /api/logs?lines=` | Log tail |
 
 ## Data freshness (remote mode, honest numbers)
 
 Persistent SSH (one handshake, auto-reconnect) · fan fast lane ~1 RTT polled 1s ·
 full status ~2s over SSE · history DB re-pulled ≤ every 30s · TrueNAS temps ~5 min
-(by TrueNAS design) · ms clock / boosted-since / down-since timers tick client-side
-at 97ms on any transport.
+(by TrueNAS design) · NAS CPU/RAM/array-I/O live ~2s via the persistent WS
+`reporting.realtime` subscription (WS `get_data` + legacy REST only as failsafes;
+the card note shows `nas via <source>` or the chained error) · ms clock /
+boosted-since / down-since timers tick client-side at 97ms on any transport
+(countdown labels render whole seconds so they don't flicker).
 
 ## Troubleshooting
 
@@ -121,6 +127,8 @@ at 97ms on any transport.
 | `No module named 'paramiko'` | Native remote needs it: `pip install paramiko` (Docker image already has it) |
 | Login loops / 401s | Wrong password, or token expired (12h TTL — just log in again) |
 | Edits don't affect fans | Editor saves the file — restart the **controller** (`docker compose restart controller`) |
+| NAS gauges / array I/O empty | Card note shows the chain (`nas via realtime` vs `realtime: … \| ws: … \| rest: …`); API key needs `REPORTING_READ`; restart admin after key/config changes (hub + z2m threads bind at startup) |
+| Room sensor shows an error | `sensors.topic` must match the Zigbee2MQTT topic (default `zigbee2mqtt/<friendly-name>`); broker must be reachable from the admin host, user/pass optional |
 | Port in use | Another admin running: `ps aux \| grep uvicorn` / `docker ps` |
 
 Security: keep `:6767` LAN-only behind your firewall, set a strong `ADMIN_PASS`,

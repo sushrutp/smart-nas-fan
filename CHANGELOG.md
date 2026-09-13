@@ -6,6 +6,41 @@ Releases go straight to `main`.
 
 ## [Unreleased]
 
+## [1.13] – 2026-09-13
+### Changed
+- TrueNAS access is WebSocket-first: controller uses JSON-RPC 2.0 on
+  `/api/current` (`auth.login_with_api_key`, one session for
+  `disk.query` + `disk.temperatures`); new `truenas.api_transport`
+  (`auto`/`ws`/`rest`) with legacy REST as last resort. REST is deprecated
+  since TrueNAS 25.04 (alerts since 25.10.1).
+- Admin metrics go live: persistent WS hub subscribes to `reporting.realtime`
+  (CPU/RAM/disk-IO ~2s frames, zero per-call handshake); WS `get_data` and
+  legacy REST are failsafes and the card note shows `nas via <source>` or the
+  chained `realtime | ws | rest` error (no more silent empty gauges).
+- MQTT auth explicitly optional (empty user/pass = anonymous, e.g. Mosquitto
+  `allow_anonymous`); controller publisher self-heals (throttled background
+  reconnect, dead-client teardown, reconnect log line) instead of staying dead
+  after a boot-time broker outage.
+- `setup.sh` takes an install dir (default: current directory) with `--from`,
+  `--no-apt`, `--no-systemd`, `--skip-deps`, `--dry-run`; every step narrates
+  what it does + the exact command, secrets stay redacted, live config is never
+  overwritten, units are backed up to `.bak`.
+### Added
+- Admin config editor renders env-expanded values (passwords masked), asks for
+  confirmation before save, and keeps easy/raw panes in sync via dry-run
+  `POST /api/config/preview`; both panes refresh from disk after save.
+- Room sensor tile: background Zigbee2MQTT subscriber (`sensors.topic/keys`,
+  broker creds reused) feeds `indoor` temp/humidity into `/api/weather`.
+- Per-drive 60s trend arrows (⬆️/⬇️/➡️ + delta tooltip) on the temp chips;
+  distinct golden-angle chart colors per drive.
+- Weather `latitude`/`longitude` override (skips geocoding) + tolerant country
+  match (two-way substring, ISO code, single-hit fallback).
+- Manual slider latency: controller picks overrides up in ≤2s, GUI updates the
+  pill optimistically and re-polls after each change; countdown labels render
+  whole seconds in fixed-width digits (no flicker).
+- Deps: `websocket-client` in `requirements.txt`; admin image + compose carry
+  `paho-mqtt`, `websocket-client` and the MQTT/TRUENAS/NTFY env.
+
 ## [1.12] – 2026-09-10
 ### Changed
 - Renamed the whole project `nastemp-2` → `smart-nas-fan`: paths

@@ -560,7 +560,8 @@ async function fetchWeather() {
 }
 
 /* ---------- neon chart: per-drive temps + fan% + ntfy 0/1 ---------- */
-const PALETTE = ['#5b8cff', '#b48cff', '#ff9f1c', '#f5ff38', '#ff7ab8', '#39ff88'];
+/* drive lines: golden-angle hues so each drive is visually distinct, no repeats */
+const driveColor = i => `hsl(${Math.round((i * 137.5 + 210) % 360)} 95% 65%)`;
 async function chart() {
   let readings, events, series = {};
   if (DEMO) {
@@ -616,14 +617,14 @@ function drawChart(readings, events, series) {
     const f = (t - rt[0]) / Math.max(1, rt[rt.length-1] - rt[0]);
     return L + Math.min(1, Math.max(0, f)) * (W - L - R); };
   names.forEach((n, j) => {
-    const col = PALETTE[j % PALETTE.length];
+    const col = driveColor(j);
     x.strokeStyle = col + 'aa'; x.lineWidth = 1; x.shadowColor = col; x.shadowBlur = 3;
     x.beginPath();
     series[n].forEach((q, i) => i ? x.lineTo(Xi(q.ts), Yt(q.temp)) : x.moveTo(Xi(q.ts), Yt(q.temp)));
     x.stroke(); x.shadowBlur = 0;
   });
   $('legendDrives').innerHTML = names.map((n, j) =>
-    `<span><span class="chip" style="background:${PALETTE[j % PALETTE.length]}"></span>💽 ${esc(n)}</span>`).join(' ');
+    `<span><span class="chip" style="background:${driveColor(j)}"></span>💽 ${esc(n)}</span>`).join(' ');
   const line = (fn, color, width) => { x.strokeStyle = color; x.lineWidth = width; x.shadowColor = color; x.shadowBlur = 9;
     x.beginPath(); pts.forEach((p, i) => i ? x.lineTo(X(i), fn(p)) : x.moveTo(X(0), fn(p))); x.stroke(); x.shadowBlur = 0; x.lineWidth = 1; };
   line(p => Yp(p.pct), '#39ff88', 2);
@@ -671,7 +672,7 @@ $('chart').addEventListener('mousemove', e => {
   x.beginPath(); x.arc(X, ch.Yp(p.pct), 4.5, 0, 7); x.fill(); x.shadowBlur = 0;
   // tooltip
   const drives = ch.names.map(nm =>
-    `<br>💽 ${nm}: <b style="color:${PALETTE[ch.names.indexOf(nm) % PALETTE.length]}">${f2(nearestTemp(ch.series[nm], t))}°C</b>`).join('');
+    `<br>💽 ${nm}: <b style="color:${driveColor(ch.names.indexOf(nm))}">${f2(nearestTemp(ch.series[nm], t))}°C</b>`).join('');
   const evHere = (ch.events || []).filter(q => Math.abs(new Date(q.ts).getTime() - t) <= 90000);
   const tip = $('tip');
   tip.innerHTML = `🕐 ${fTS(t)}<br>🔥 max: <b style="color:#00f0ff">${f2(p.max)}°C</b>${drives}<br>🌀 fan: <b style="color:#39ff88">${f2(p.pct)}%</b> (pwm ${p.pwm ?? '–'})` +
@@ -703,6 +704,7 @@ function renderHost(h) {
   if (p.ram_used_gb != null) bits.push(`prox ${p.ram_used_gb}GB used`);
   if (!p.ok) bits.push('prox: ' + (p.error || '?'));
   if (!t.ok && t.error) bits.push('nas: ' + t.error);
+  else if (t.source) bits.push('nas via ' + t.source + (t.age_s != null ? ` · ${t.age_s}s old` : ''));
   $('hostNote').textContent = bits.join(' · ') || '–';
   const r = t.read_mbs, w = t.write_mbs;
   $('ioR').textContent = r == null ? '–' : r;
@@ -795,9 +797,15 @@ async function fetchManual() {
   } catch (e) {}
 }
 async function postManual(body) {
+  /* optimistic pill so the click feels instant, then 3 fast re-polls
+     (controller picks the override up within ~2s) instead of waiting
+     for the 10s fetchManual interval */
+  if (!body.auto) { $('mMode').className = 'pill warn'; $('mMode').textContent = '🎛️ MANUAL…'; }
   await fetch('/api/manual', {method: 'POST', headers: {...H(), 'Content-Type': 'application/json'},
     body: JSON.stringify(body)});
   await fetchManual();
+  setTimeout(fetchManual, 600);
+  setTimeout(fetchManual, 1800);
 }
 function sliderPct() {
   const v = +$('mSlider').value;
