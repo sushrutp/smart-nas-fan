@@ -16,7 +16,9 @@ truenas:
   poll_metrics_sec: 30
 fan:
   pwm_channel: pwm2
-  driver_match: it87
+  driver_match: it87,it86 # comma-separated hwmon name substrings: it87 covers it87xx,
+                          # it86 covers it8613/it862x/it8665 (newer ITE chips, same pwm interface).
+                          # Set via GUI if `grep -H . /sys/class/hwmon/hwmon*/name` shows another chip.
   floor_pct: 40
   floor_pwm: 102
   ceiling_pct: 72

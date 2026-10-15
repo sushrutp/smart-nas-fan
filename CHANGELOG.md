@@ -6,6 +6,13 @@ Releases go straight to `main`.
 
 ## [Unreleased]
 ### Fixed
+- Fan chip detection no longer hardcoded to `it87`: fresh kernels expose ITE
+  chips as `it8613`/`it86xx`, which broke control + the GUI gauge after a
+  Proxmox reinstall. `fan.driver_match` is now a comma-separated list
+  (default `it87,it86`, GUI-editable) honored by the controller, the
+  watchdog (`NASTEMP_DRIVER` override), and all three admin fan paths
+  (status, remote, 1s fast lane — which now also respects `pwm_channel`).
+  The controller's fatal message prints the hwmon names it actually saw.
 - TrueNAS auth failures are self-diagnosing now: `ws auth rejected` names the
   cause (bad/revoked API key — TrueNAS upgrades revoke allow-list keys and
   migrate legacy ones) and points at Credentials -> API Keys for a fresh key.

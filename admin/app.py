@@ -578,9 +578,22 @@ def _truenas_api_live(cfg):
         return {"ok": False, "error": err[:220], "latency_ms": int((time.time() - t0) * 1000)}
 
 
+def _hw_drivers(cfg):
+    """hwmon name substrings for the fan chip (default 'it87,it86').
+
+    Same knob as the controller's fan.driver_match: it87 covers it87xx, it86
+    covers it8613/it862x/it8665. Read from config so a board/kernel change is
+    a GUI edit, not a code edit."""
+    try:
+        raw = str((cfg or {}).get("fan", {}).get("driver_match", "it87,it86") or "it87,it86")
+    except Exception:
+        raw = "it87,it86"
+    return [d.strip() for d in raw.split(",") if d.strip()]
+
+
 def fan_hw(cfg=None):
     """Live PWM: local sysfs, or Proxmox sysfs over SSH in remote mode."""
-    res = _fan_hw_local()
+    res = _fan_hw_local(cfg)
     if res.get("ok"):
         return res
     if is_remote():
@@ -591,15 +604,22 @@ def fan_hw(cfg=None):
     return res
 
 
-def _fan_hw_local():
+def _fan_hw_local(cfg=None):
     """Read live PWM from sysfs (works in container with :ro hwmon mount)."""
+    drivers = _hw_drivers(cfg)
+    try:
+        chan_cfg = str((cfg or {}).get("fan", {}).get("pwm_channel", "pwm2") or "pwm2")
+    except Exception:
+        chan_cfg = "pwm2"
+    chans = [chan_cfg] + [c for c in ("pwm2", "pwm1") if c != chan_cfg]
     for nf in glob.glob("/sys/class/hwmon/hwmon*/name"):
         try:
             with open(nf) as f:
-                if "it87" not in f.read():
-                    continue
+                name = f.read()
+            if not any(d in name for d in drivers):
+                continue
             base = os.path.dirname(nf)
-            for chan in ("pwm2", "pwm1"):
+            for chan in chans:
                 p = os.path.join(base, chan)
                 if os.path.exists(p):
                     with open(p) as f:
@@ -616,19 +636,21 @@ def _fan_hw_local():
                     return {"ok": True, "pwm": pwm, "pct": round(pwm / 2.55, 1), "rpm": rpm}
         except Exception:
             continue
-    return {"ok": False, "error": "no it87 pwm (native Proxmox only?)"}
+    return {"ok": False, "error": f"no pwm on chips matching {','.join(drivers)} (native Proxmox only?)"}
 
 
 def _fan_hw_remote(cfg=None):
     chan = (cfg or {}).get("fan", {}).get("pwm_channel", "pwm2") if isinstance(cfg, dict) else "pwm2"
     num = "".join(c for c in chan if c.isdigit()) or "2"
+    drivers = _hw_drivers(cfg)
     base = None
     for nf in prox_exec("ls /sys/class/hwmon/hwmon*/name 2>/dev/null").split():
-        if "it87" in prox_exec("cat " + shlex.quote(nf)):
+        content = prox_exec("cat " + shlex.quote(nf))
+        if any(d in content for d in drivers):
             base = os.path.dirname(nf.strip())
             break
     if not base:
-        raise RuntimeError("no it87 hwmon on proxmox host")
+        raise RuntimeError(f"no hwmon matching {','.join(drivers)} on proxmox host")
     pwm = int(prox_exec(f"cat {base}/{chan}").strip())
     rpm = None
     try:
@@ -1468,14 +1490,15 @@ def fast(_: bool = Depends(check_auth)):
     SSH exec so the fan gauge can refresh every second."""
     if not is_remote():
         cfg = load_cfg_cached()
-        return {"fan": fan_hw(), "hb_age": heartbeat_age(cfg), "where": where()}
+        return {"fan": fan_hw(cfg), "hb_age": heartbeat_age(cfg), "where": where()}
     try:
         cfg = load_cfg_cached()
         chan = cfg.get("fan", {}).get("pwm_channel", "pwm2")
         num = "".join(c for c in chan if c.isdigit()) or "2"
         hb = cfg["timing"]["heartbeat_file"]
+        pat = "|".join(_hw_drivers(cfg)) or "it87"
         out = prox_exec(
-            f"C={shlex.quote(chan)}; H=$(grep -l it87 /sys/class/hwmon/hwmon*/name 2>/dev/null | head -1); "
+            f"C={shlex.quote(chan)}; H=$(grep -l -E {shlex.quote(pat)} /sys/class/hwmon/hwmon*/name 2>/dev/null | head -1); "
             f"B=$(dirname \"$H\" 2>/dev/null); echo P:$(cat \"$B/$C\" 2>/dev/null); "
             f"echo R:$(cat \"$B/fan{num}_input\" 2>/dev/null); echo H:$(cat {shlex.quote(hb)} 2>/dev/null)")
         vals = {}
@@ -1487,7 +1510,7 @@ def fast(_: bool = Depends(check_auth)):
             rpm = int(vals.get("R", "")) if vals.get("R", "").lstrip("-").isdigit() else None
             fan = {"ok": True, "pwm": pwm, "pct": round(pwm / 2.55, 1), "rpm": rpm}
         except Exception:
-            fan = {"ok": False, "error": "no it87 pwm on proxmox"}
+            fan = {"ok": False, "error": f"no pwm on proxmox (chips matching {pat})"}
         try:
             hb_age = round(time.time() - float(vals.get("H", "")), 1)
         except Exception:

@@ -95,6 +95,20 @@ def _mask(v):
     s = str(v or "")
     return "(empty)" if not s else f"***len{len(s)}"
 
+def _hw_drivers(cfg):
+    """hwmon name substrings that identify the fan chip, e.g. 'it87,it86'.
+
+    Fresh Proxmox kernels expose newer ITE chips as it8613/it862x (not it87)
+    with the same pwmN interface — a single hardcoded name breaks fan control
+    and the GUI gauge after every board/kernel change. Comma-separated so the
+    GUI config editor can extend it without code edits."""
+    raw = str(cfg.get("fan", {}).get("driver_match", "it87,it86") or "it87,it86")
+    return [d.strip() for d in raw.split(",") if d.strip()]
+
+
+def _hw_name_match(cfg, name):
+    return any(d in (name or "") for d in _hw_drivers(cfg))
+
 def log_startup(cfg):
     t, m, n = cfg.get("truenas", {}), cfg.get("mqtt", {}), cfg.get("ntfy", {})
     F, T, TM = cfg["fan"], cfg["temps_c"], cfg["timing"]
@@ -245,13 +259,12 @@ class PwmHw:
         self.resolve()
 
     def resolve(self):
-        drv = self.cfg["fan"]["driver_match"]
         chan = self.cfg["fan"]["pwm_channel"]  # e.g. pwm2
         num = "".join(c for c in chan if c.isdigit())
         for name_file in glob.glob("/sys/class/hwmon/hwmon*/name"):
             try:
                 with open(name_file) as f:
-                    if drv in f.read().strip():
+                    if _hw_name_match(self.cfg, f.read().strip()):
                         base = os.path.dirname(name_file)
                         self.pwm_path = os.path.join(base, chan)
                         self.enable_path = os.path.join(base, f"{chan}_enable")
@@ -261,7 +274,8 @@ class PwmHw:
                         return
             except Exception:
                 continue
-        # fallback: first pwm2 found
+        # fallback: configured channel on any hwmon (covers unlisted chips);
+        # if THAT fails too, main() prints the driver names it saw.
         cands = glob.glob("/sys/class/hwmon/hwmon*/" + chan)
         if cands:
             self.pwm_path = cands[0]
@@ -887,7 +901,16 @@ def main():
     F = cfg["fan"]; T = cfg["temps_c"]; TM = cfg["timing"]
 
     if not hw.pwm_path:
-        print("FATAL: it87 pwm path not found. Load it87 module? (modprobe it87)", flush=True)
+        seen = {}
+        for nf in glob.glob("/sys/class/hwmon/hwmon*/name"):
+            try:
+                with open(nf) as f:
+                    seen[os.path.dirname(nf)] = f.read().strip()
+            except Exception:
+                pass
+        print(f"FATAL: no '{F['pwm_channel']}' on chips matching {cfg['fan'].get('driver_match')} "
+              f"(hwmon seen: {seen or 'none'}). Check fan.driver_match/pwm_channel in config.",
+              flush=True)
         sys.exit(2)
 
     # boot: safe default 40%

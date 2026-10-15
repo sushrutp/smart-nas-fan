@@ -297,7 +297,7 @@ then restart the controller when it tells you to.
 
 | Symptom | Check |
 |---|---|
-| `pwm_path not found` | `modprobe it87`; `ls /sys/class/hwmon/hwmon*/name` |
+| `pwm_path not found` / GUI shows no fan speed | `grep -H . /sys/class/hwmon/hwmon*/name` — fresh kernels expose ITE chips as `it8613`/`it86xx`, not `it87`. Default `fan.driver_match: it87,it86` already covers both; if yours shows another chip (e.g. `nct6775`), set it in the GUI config editor and restart the controller |
 | API 401 / `api_key missing` | key valid? https only? `.env: TRUENAS_API_KEY` set? |
 | `SSH FAIL` | key auth, TrueNAS SSH on, user can run `smartctl` |
 | `no temp parsed` | on TrueNAS: `smartctl -A -j /dev/sda` (needs current smartmontools) |

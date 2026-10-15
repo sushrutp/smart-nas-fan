@@ -15,7 +15,10 @@ HEARTBEAT = os.environ.get("NASTEMP_HEARTBEAT", "/run/smart-nas-fan/heartbeat")
 SAFE_PWM = int(os.environ.get("NASTEMP_SAFE_PWM", "102"))
 STALE_SEC = int(os.environ.get("NASTEMP_STALE_SEC", "300"))  # 5 min
 CHECK_SEC = 15
-DRV = "it87"
+# Comma-separated hwmon name substrings (it87 covers it87xx, it86 covers
+# it8613/it862x/it8665). Override with NASTEMP_DRIVER if your board differs —
+# see `grep -H . /sys/class/hwmon/hwmon*/name`.
+DRV = [d.strip() for d in os.environ.get("NASTEMP_DRIVER", "it87,it86").split(",") if d.strip()]
 CHAN = os.environ.get("NASTEMP_PWM", "pwm2")
 DBG = os.environ.get("NASTEMP_DEBUG", "") not in ("", "0", "no", "false")
 
@@ -27,8 +30,9 @@ def find_pwm():
     for nf in glob.glob("/sys/class/hwmon/hwmon*/name"):
         try:
             with open(nf) as f:
-                if DRV in f.read():
-                    return os.path.join(os.path.dirname(nf), CHAN)
+                name = f.read()
+            if any(d in name for d in DRV):
+                return os.path.join(os.path.dirname(nf), CHAN)
         except Exception:
             continue
     c = glob.glob(f"/sys/class/hwmon/hwmon*/{CHAN}")
