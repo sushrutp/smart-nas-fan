@@ -303,6 +303,26 @@ def invalidate_cfg_cache():
 
 # ---------- probes ----------
 
+def _tn_key(cfg):
+    """TrueNAS API key from env (wins) or config, whitespace-stripped.
+
+    Copy-paste from the TrueNAS UI often drags in a trailing newline/space,
+    which the server rejects as a bad key — stripping avoids that trap."""
+    t = cfg.get("truenas", {})
+    return str(os.environ.get("TRUENAS_API_KEY") or t.get("api_key") or "").strip()
+
+
+def _tn_auth_rejected(where):
+    """Hint-rich error for `auth.login_with_api_key -> false`.
+
+    The WS handshake itself succeeded here (network/TLS/endpoint OK), so this
+    is purely credential: wrong key, key revoked by a TrueNAS upgrade
+    (allow-list keys are revoked, legacy keys migrated), or insufficient
+    roles. Tells the operator exactly where to mint a new one."""
+    return (f"{where}: ws auth rejected (bad/revoked API key?). Create a fresh key "
+            f"in TrueNAS (Credentials -> API Keys) and update TRUENAS_API_KEY.")
+
+
 def _tn_ws_url(cfg):
     """wss://host/api/current derived from api_url/host (JSON-RPC 2.0, TrueNAS 25.04+)."""
     t = cfg.get("truenas", {})
@@ -344,9 +364,9 @@ def _tn_ws_batch(cfg, calls, timeout=10):
     except ImportError:
         raise RuntimeError("websocket-client not installed")
     t = cfg.get("truenas", {})
-    key = os.environ.get("TRUENAS_API_KEY") or t.get("api_key") or ""
+    key = _tn_key(cfg)
     if not key:
-        raise RuntimeError("api_key missing")
+        raise RuntimeError("api_key missing (set TRUENAS_API_KEY env / .env)")
     url = _tn_ws_url(cfg)
     to = min(int(t.get("timeout_sec", 8)), timeout)
     verify = bool(t.get("verify_ssl", False))
@@ -356,7 +376,7 @@ def _tn_ws_batch(cfg, calls, timeout=10):
         ws.send(json.dumps({"jsonrpc": "2.0", "id": 1,
                             "method": "auth.login_with_api_key", "params": [key]}))
         if _tn_ws_recv(ws, 1, to) is not True:
-            raise RuntimeError("ws auth rejected")
+            raise RuntimeError(_tn_auth_rejected("disk temps"))
         out, rid = [], 10
         for method, params in calls:
             ws.send(json.dumps({"jsonrpc": "2.0", "id": rid,
@@ -379,9 +399,9 @@ def _tn_ws_query_then_temps(cfg, timeout=10):
     """disk.query + disk.temperatures over one WS session. Returns (disks, raw_temps)."""
     import websocket
     t = cfg.get("truenas", {})
-    key = os.environ.get("TRUENAS_API_KEY") or t.get("api_key") or ""
+    key = _tn_key(cfg)
     if not key:
-        raise RuntimeError("api_key missing")
+        raise RuntimeError("api_key missing (set TRUENAS_API_KEY env / .env)")
     url = _tn_ws_url(cfg)
     to = min(int(t.get("timeout_sec", 8)), timeout)
     verify = bool(t.get("verify_ssl", False))
@@ -391,7 +411,7 @@ def _tn_ws_query_then_temps(cfg, timeout=10):
         ws.send(json.dumps({"jsonrpc": "2.0", "id": 1,
                             "method": "auth.login_with_api_key", "params": [key]}))
         if _tn_ws_recv(ws, 1, to) is not True:
-            raise RuntimeError("ws auth rejected")
+            raise RuntimeError(_tn_auth_rejected("disk temps"))
         ws.send(json.dumps({"jsonrpc": "2.0", "id": 10, "method": "disk.query",
                             "params": [[], {"select": ["name", "type", "rotationrate", "model"]}]}))
         disks = _tn_ws_recv(ws, 10, to)
@@ -491,9 +511,9 @@ def truenas_api(cfg):
 def _truenas_api_live(cfg):
     """HDD temps via TrueNAS API. Returns dict with ok/temps/error/latency."""
     t = cfg.get("truenas", {})
-    key = os.environ.get("TRUENAS_API_KEY") or t.get("api_key") or ""
+    key = _tn_key(cfg)
     if not key:
-        return {"ok": False, "error": "api_key missing"}
+        return {"ok": False, "error": "api_key missing (set TRUENAS_API_KEY env / .env)"}
     base = (t.get("api_url") or f"https://{t.get('host', '')}").rstrip("/")
     verify = bool(t.get("verify_ssl", False))
     if not verify:
@@ -1037,9 +1057,9 @@ def _tn_req(cfg, method, params, timeout=12):
                  f"{method} websocket FAILED ({e}) — REST fallback (deprecated)")
             debug(f"TrueNAS {method} WS failed ({e}), REST fallback")
     t = cfg.get("truenas", {})
-    key = os.environ.get("TRUENAS_API_KEY") or t.get("api_key") or ""
+    key = _tn_key(cfg)
     if not key:
-        raise RuntimeError("api_key missing")
+        raise RuntimeError("api_key missing (set TRUENAS_API_KEY env / .env)")
     base = (t.get("api_url") or f"https://{t.get('host', '')}").rstrip("/")
     verify = bool(t.get("verify_ssl", False))
     if not verify:
@@ -1137,9 +1157,9 @@ def _tnhub_open(cfg, timeout=10):
     except ImportError:
         raise RuntimeError("websocket-client not installed")
     t = cfg.get("truenas", {})
-    key = os.environ.get("TRUENAS_API_KEY") or t.get("api_key") or ""
+    key = _tn_key(cfg)
     if not key:
-        raise RuntimeError("api_key missing")
+        raise RuntimeError("api_key missing (set TRUENAS_API_KEY env / .env)")
     url = _tn_ws_url(cfg)
     to = min(int(t.get("timeout_sec", 8)), timeout)
     verify = bool(t.get("verify_ssl", False))
@@ -1149,7 +1169,7 @@ def _tnhub_open(cfg, timeout=10):
         ws.send(json.dumps({"jsonrpc": "2.0", "id": 1,
                             "method": "auth.login_with_api_key", "params": [key]}))
         if _tn_ws_recv(ws, 1, to) is not True:
-            raise RuntimeError("ws auth rejected")
+            raise RuntimeError(_tn_auth_rejected("realtime hub"))
         return ws
     except Exception:
         try:
@@ -1339,9 +1359,9 @@ def _parse_reporting_graphs(out):
 def _tn_rest_reporting_legacy(cfg, timeout=15):
     """Last-resort legacy REST shape (pre-25.04 form): slash URL + dict body."""
     t = cfg.get("truenas", {})
-    key = os.environ.get("TRUENAS_API_KEY") or t.get("api_key") or ""
+    key = _tn_key(cfg)
     if not key:
-        raise RuntimeError("api_key missing")
+        raise RuntimeError("api_key missing (set TRUENAS_API_KEY env / .env)")
     base = (t.get("api_url") or f"https://{t.get('host', '')}").rstrip("/")
     verify = bool(t.get("verify_ssl", False))
     if not verify:

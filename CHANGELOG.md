@@ -5,6 +5,13 @@ The `VERSION` file + admin UI header badge always show the current release.
 Releases go straight to `main`.
 
 ## [Unreleased]
+### Fixed
+- TrueNAS auth failures are self-diagnosing now: `ws auth rejected` names the
+  cause (bad/revoked API key — TrueNAS upgrades revoke allow-list keys and
+  migrate legacy ones) and points at Credentials -> API Keys for a fresh key.
+  API keys are whitespace-stripped everywhere (controller + all 6 admin call
+  sites share one `_tn_key()` helper), so a trailing newline from UI
+  copy-paste can't silently break auth anymore.
 ### Added
 - Poll cadence knobs: `truenas.poll_temps_sec` (default 15, clamped 5..300)
   and `truenas.poll_metrics_sec` (default 30, clamped 10..600), both in the

@@ -307,7 +307,8 @@ class PwmHw:
 # ---------- TrueNAS API temps (HDD-only, preferred) ----------
 
 def _api_key(cfg):
-    return os.environ.get("TRUENAS_API_KEY") or cfg["truenas"].get("api_key") or ""
+    key = os.environ.get("TRUENAS_API_KEY") or cfg["truenas"].get("api_key") or ""
+    return str(key).strip()
 
 _transport_state = {"ws_ok": True}  # flip-flop guard: log WS<->REST transitions once
 
@@ -411,7 +412,11 @@ def _ws_connect(cfg):
             ws.close()
         except Exception:
             pass
-        raise RuntimeError(f"truenas ws auth rejected (result={result!r})")
+        raise RuntimeError(
+            "truenas ws auth rejected (bad/revoked API key?). "
+            "TrueNAS upgrades revoke allow-list API keys and migrate legacy ones — "
+            "create a fresh key (Credentials -> API Keys) and update TRUENAS_API_KEY. "
+            f"(result={result!r})")
     return ws
 
 def ws_api_post(cfg, method, params=None):
